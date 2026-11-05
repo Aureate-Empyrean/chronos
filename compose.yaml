@@ -1,0 +1,9 @@
+name: chronos
+services:
+  image:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: chronos:0.1.1
+    network_mode: none
+    entrypoint: [python, -c, "print('Install manifest.local.json in Nexus; the broker owns the runtime.')"]

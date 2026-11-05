@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <!-- Chronos application icon: a crescent moon and a four-point star on the celestial-blue
+       tile of the header mark. Full-bleed square; the host applies the corner radius. -->
+  <defs>
+    <linearGradient id="tile" x1=".21" y1=".09" x2=".79" y2=".91">
+      <stop offset="0" stop-color="#b9d2f7"/>
+      <stop offset=".45" stop-color="#7aa7eb"/>
+      <stop offset="1" stop-color="#8f86f0"/>
+    </linearGradient>
+    <radialGradient id="sheen" cx=".3" cy=".25" r=".45">
+      <stop offset="0" stop-color="#fff" stop-opacity=".35"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="48" height="48" fill="url(#tile)"/>
+  <rect width="48" height="48" fill="url(#sheen)"/>
+  <g transform="translate(9.33 9.33) scale(1.222)" fill="none" stroke="#0b1424" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M11.5 4.5a6.5 6.5 0 0 0 8 8 8 8 0 1 1-8-8Z"/>
+    <path d="M18.6 2.2c.3 1.7 1.1 2.5 2.8 2.8-1.7.3-2.5 1.1-2.8 2.8-.3-1.7-1.1-2.5-2.8-2.8 1.7-.3 2.5-1.1 2.8-2.8z" fill="#0b1424" stroke="none"/>
+  </g>
+</svg>
