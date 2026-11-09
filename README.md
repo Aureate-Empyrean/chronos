@@ -30,6 +30,13 @@ Calendars and events for Aureate Empyrean. Canonical architecture: `../architect
 
 Read-only by design: no two-way synchronization, no CalDAV, no reminders yet.
 
+## Navigation (0.5.0 on aetest)
+
+Calendar views, dates, native events, single occurrences and projected dates are browser history entries through the
+Nexus navigation contract (`frontend/navigation.js`). Search and category filters are private per-entry state. An
+unsaved event editor stays open while the address moves, and is kept as a draft when Chronos is left. Open on a
+projected date uses the owner's resolved path where one exists. See `../empyrean-nexus/docs/navigation-history.md`.
+
 ## Added in 0.4.0 (production since 2026-11-09)
 
 A names-only `link-search` projection, and a deep link to one event ([record](../VALIDATION_PHASE5_AETEST_2026-11-09.md)).

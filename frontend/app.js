@@ -513,6 +513,7 @@ function renderView() {
   $("#title").innerHTML = titleText();
   $$(".views button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.view === state.view && !state.results)));
   const view = $("#view");
+  if (state.notFound) return (view.innerHTML = `<div class="ae-empty">${icon("alert")}<h3>${esc(t("This page could not be found"))}</h3><p>${esc(t("The address may be wrong, or the event may have been removed."))}</p><button class="ae-btn" data-act="today">${esc(t("Today"))}</button></div>`);
   if (state.results) return renderResults(view);
   if (state.error)
     return (view.innerHTML = `<div class="ae-banner ae-banner--danger view-error">${icon("alert")}<div><strong>${esc(t("Events could not be loaded."))}</strong><br>${esc(state.error)}</div><button class="ae-btn ae-btn--sm" data-act="reload">${esc(t("Try again"))}</button></div>`);
@@ -711,12 +712,23 @@ function renderResults(view) {
 function findOccurrence(key) {
   return state.occurrences.find((o) => o.key === key) || state.searchIndex?.get(key);
 }
-function closeLayer() {
+/** Close the details drawer. Its address goes with it: a push when the owner closes it, a
+ * replace when an action made the record go away. */
+function closeLayer({ mode = "push" } = {}) {
+  closeLayerUI();
+  if (chronosNavigation.enabled && routeHasDetail()) commitRoute(calendarRoute(), mode);
+}
+let detailSerial = 0;
+function closeLayerUI() {
+  ++detailSerial;
   const drawer = $(".ae-drawer");
   if (!drawer) return;
   drawer.classList.add("is-leaving");
   $(".ae-scrim")?.remove();
-  setTimeout(() => ($("#layer").innerHTML = ""), reducedMotion() ? 0 : 170);
+  // Only the drawer that was closing: another may have opened in the meantime.
+  setTimeout(() => {
+    if ($(".ae-drawer")?.classList.contains("is-leaving")) $("#layer").innerHTML = "";
+  }, reducedMotion() ? 0 : 170);
   state.selected?.returnFocus?.focus?.();
   state.selected = null;
 }
@@ -753,11 +765,14 @@ function ruleText(rrule, start) {
 async function openDetails(key, trigger) {
   const o = findOccurrence(key);
   if (!o) return;
+  const serial = ++detailSerial;
   state.selected = { key, returnFocus: trigger };
   const isProjection = o.origin === "projection";
   let event = null;
   if (!isProjection) {
     event = await attempt(() => api(`/events/${o.event_id}`));
+    // Superseded while loading: the late response must not open over the newer screen.
+    if (serial !== detailSerial) return;
     if (!event) return;
   }
   const facts = [];
@@ -796,7 +811,7 @@ async function openDetails(key, trigger) {
   const actions = [];
   if (isProjection) {
     actions.push(`<button class="ae-btn ae-btn--primary" data-act="plan" data-key="${esc(o.key)}">${icon("plus")}<span>${esc(t("Plan in my calendar"))}</span></button>`);
-    if (state.context.applications.some((a) => a.id === o.provider)) actions.push(`<button class="ae-btn" data-act="open-module" data-module="${esc(o.provider)}">${icon("open")}<span>${esc(t("Open {name}", { name: PROVIDERS[o.provider]?.name || o.provider }))}</span></button>`);
+    if (state.context.applications.some((a) => a.id === o.provider)) actions.push(`<button class="ae-btn" data-act="open-projected" data-key="${esc(o.key)}">${icon("open")}<span>${esc(t("Open {name}", { name: PROVIDERS[o.provider]?.name || o.provider }))}</span></button>`);
   } else if (event.readonly) {
     actions.push(`<button class="ae-btn" data-act="copy" data-id="${esc(event.id)}">${icon("copy")}<span>${esc(t("Copy to my calendar"))}</span></button>`);
   } else {
@@ -1171,7 +1186,7 @@ async function eventEditor(existing, defaults = {}) {
     try {
       const saved = existing ? await api(`/events/${existing.id}`, "PUT", body) : await api("/events", "POST", body);
       closeDialog();
-      closeLayer();
+      closeLayer({ mode: "replace" });
       toast(existing ? t("Event saved") : t("Event created"));
       if (!existing) state.cursor = saved.all_day ? saved.start : zoneParts(new Date(saved.start)).day;
       await refresh();
@@ -1182,6 +1197,7 @@ async function eventEditor(existing, defaults = {}) {
     }
   };
   sync();
+  eventEditorOpened(existing, defaults);
 }
 
 /* Import */
@@ -1408,22 +1424,35 @@ async function refresh() {
   await loadOccurrences();
   schedulePoll();
 }
+/** Inside a Nexus with the navigation contract every move is a browser history entry and is
+ * shown when Nexus confirms it (frontend/navigation.js); otherwise it is shown directly. */
 function go(view, cursor = state.cursor) {
-  state.view = view;
-  state.cursor = cursor;
   state.miniCursor = null;
+  // Via Nexus the search is cleared once this entry's view state has been recorded with it.
+  if (chronosNavigation.enabled && ChronosRoutes.serialize({ view, date: cursor }) !== shownRoute) {
+    clearSearchOnApply = true;
+    return commitRoute({ view, date: cursor });
+  }
   state.results = null;
   if ($("#search")) $("#search").value = state.query = "";
+  state.view = view;
+  state.cursor = cursor;
   loadOccurrences();
 }
 function step(direction) {
-  const c = state.cursor;
-  if (state.view === "month") state.cursor = addMonths(c, direction);
-  else if (state.view === "week") state.cursor = addDays(c, 7 * direction);
-  else if (state.view === "day") state.cursor = addDays(c, direction);
-  else state.cursor = addDays(c, state.agendaDays * direction);
+  // A step still on its way to Nexus counts, so repeated presses do not collapse into one.
+  const c = chronosNavigation.enabled ? queuedRoute?.date || state.cursor : state.cursor;
+  let cursor = c;
+  if (state.view === "month") cursor = addMonths(c, direction);
+  else if (state.view === "week") cursor = addDays(c, 7 * direction);
+  else if (state.view === "day") cursor = addDays(c, direction);
+  else cursor = addDays(c, state.agendaDays * direction);
   state.miniCursor = null;
-  loadOccurrences();
+  if (chronosNavigation.enabled) commitRoute({ view: state.view, date: cursor });
+  else {
+    state.cursor = cursor;
+    loadOccurrences();
+  }
   animate($("#view"), [{ opacity: 0.4, transform: `translateX(${direction * 10}px)` }, { opacity: 1, transform: "none" }], { duration: 200 });
 }
 function calendarMenu(anchor, c) {
@@ -1455,10 +1484,10 @@ function calendarMenu(anchor, c) {
 }
 function eventMenu(anchor, id, occurrence) {
   const o = findOccurrence(state.selected?.key);
-  const items = [{ label: t("Duplicate"), icon: "copy", run: async () => { await attempt(() => api(`/events/${id}/copy`, "POST", { calendar_id: o?.calendar_id || nativeCalendars()[0].id }), t("Event duplicated")); closeLayer(); await refresh(); } }];
+  const items = [{ label: t("Duplicate"), icon: "copy", run: async () => { await attempt(() => api(`/events/${id}/copy`, "POST", { calendar_id: o?.calendar_id || nativeCalendars()[0].id }), t("Event duplicated")); closeLayer({ mode: "replace" }); await refresh(); } }];
   items.push("-");
   if (o?.recurring && occurrence)
-    items.push({ label: t("Delete this occurrence"), icon: "trash", danger: true, run: async () => { await attempt(() => api(`/events/${id}?occurrence=${encodeURIComponent(occurrence)}`, "DELETE"), t("Occurrence removed")); closeLayer(); await refresh(); } });
+    items.push({ label: t("Delete this occurrence"), icon: "trash", danger: true, run: async () => { await attempt(() => api(`/events/${id}?occurrence=${encodeURIComponent(occurrence)}`, "DELETE"), t("Occurrence removed")); closeLayer({ mode: "replace" }); await refresh(); } });
   items.push({
     label: o?.recurring ? t("Delete all occurrences") : t("Delete event"),
     icon: "trash",
@@ -1466,7 +1495,7 @@ function eventMenu(anchor, id, occurrence) {
     run: () =>
       confirmAction(t("Delete “{name}”?", { name: o?.title || "" }), o?.recurring ? t("Every occurrence of this repeating event is deleted.") : t("This cannot be undone."), t("Delete"), async () => {
         await attempt(() => api(`/events/${id}`, "DELETE"), t("Event deleted"));
-        closeLayer();
+        closeLayer({ mode: "replace" });
         await refresh();
       }),
   });
@@ -1485,7 +1514,12 @@ function choosePlanCalendar(run) {
 
 document.addEventListener("click", async (event) => {
   const opener = event.target.closest("[data-open]");
-  if (opener) return openDetails(opener.dataset.open, opener);
+  if (opener) {
+    const o = chronosNavigation.enabled ? findOccurrence(opener.dataset.open) : null;
+    if (!o) return openDetails(opener.dataset.open, opener);
+    pendingTrigger = opener;
+    return commitRoute(routeForOccurrence(o));
+  }
   const viewButton = event.target.closest("[data-view]");
   if (viewButton) return go(viewButton.dataset.view);
   const target = event.target.closest("[data-act]");
@@ -1548,7 +1582,7 @@ document.addEventListener("click", async (event) => {
   if (act === "copy")
     return choosePlanCalendar(async (calendar) => {
       if (await attempt(() => api(`/events/${id}/copy`, "POST", { calendar_id: calendar }), t("Copied to your calendar"))) {
-        closeLayer();
+        closeLayer({ mode: "replace" });
         await refresh();
       }
     });
@@ -1556,10 +1590,18 @@ document.addEventListener("click", async (event) => {
     const o = findOccurrence(target.dataset.key);
     return choosePlanCalendar(async (calendar) => {
       if (await attempt(() => api("/projected/plan", "POST", { provider: o.provider, item_id: o.item_id, calendar_id: calendar }), t("Added to your calendar, linked to {name}", { name: PROVIDERS[o.provider]?.name || o.provider }))) {
-        closeLayer();
+        closeLayer({ mode: "replace" });
         await refresh();
       }
     });
+  }
+  if (act === "open-projected") {
+    const o = findOccurrence(target.dataset.key);
+    if (!o) return;
+    const found = await attempt(() => api(`/projected/open?provider=${encodeURIComponent(o.provider)}&item_id=${encodeURIComponent(o.item_id)}`));
+    if (!found) return;
+    if (["deleted", "not_found"].includes(found.availability)) return toast(t("This is no longer available in {name}.", { name: PROVIDERS[o.provider]?.name || o.provider }), "danger");
+    return bridge("navigate", { module: o.provider, ...(found.open_path ? { path: found.open_path } : {}) }).catch((e) => toast(e.message, "danger"));
   }
   if (act === "open-module") return bridge("navigate", { module: target.dataset.module, ...(target.dataset.path ? { path: target.dataset.path } : {}) }).catch((e) => toast(e.message, "danger"));
   if (act === "add-person") {
@@ -1673,7 +1715,7 @@ document.addEventListener("keydown", (event) => {
   }
 });
 window.addEventListener("resize", () => {
-  if (state.view === "month") renderView();
+  if (state.view === "month" && state.cursor) renderView();
 });
 
 /* ───────────────────────── Start ───────────────────────── */
@@ -1700,6 +1742,29 @@ async function start() {
   state.cursor = today();
   renderShell();
   renderSidebar();
+  setInterval(() => {
+    if (state.view === "week" || state.view === "day") {
+      const line = $(".now-line");
+      if (line) line.style.top = `calc(${zoneParts(new Date()).minutes / 60} * var(--hour))`;
+    }
+  }, 60000);
+  // Inside a Nexus that supports it, the browser URL and Back/Forward follow Chronos's screens.
+  if (state.context.navigation?.versions?.includes(1)) {
+    try {
+      if (await chronosNavigation.start(state.context)) {
+        schedulePoll();
+        // The first screen gets its exact address (view and date) without a new history entry.
+        const initial = shownParsed && !shownParsed.notFound && !shownParsed.date && !shownParsed.event && !shownParsed.projected ? ChronosRoutes.serialize(calendarRoute()) : shownRoute;
+        if (initial) {
+          if (initial !== shownRoute) shownRoute = initial;
+          await queueNavigation(initial, "replace").catch(() => {});
+        }
+        return;
+      }
+    } catch {
+      /* the host did not answer the handshake: keep the in-memory navigation below */
+    }
+  }
   await loadOccurrences();
   schedulePoll();
   // A link to one event, from another module (open_path of the resolver).
@@ -1713,11 +1778,5 @@ async function start() {
       if (found) openDetails(found.key);
     }
   }
-  setInterval(() => {
-    if (state.view === "week" || state.view === "day") {
-      const line = $(".now-line");
-      if (line) line.style.top = `calc(${zoneParts(new Date()).minutes / 60} * var(--hour))`;
-    }
-  }, 60000);
 }
 start();

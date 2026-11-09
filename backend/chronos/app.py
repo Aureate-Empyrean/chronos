@@ -1045,6 +1045,27 @@ def create_app(
             )
             return {"sources": sources_json(conn)}
 
+    @app.get("/api/projected/open")
+    def projected_open(provider: str, item_id: str):
+        """Where a projected date lives in its owner module, per the owner's own resolver.
+
+        No path is ever derived from a label or an item id: without an available, resolved
+        target the answer is simply no path, and Chronos opens the provider itself."""
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT resource FROM projected WHERE provider=? AND item_id=?",
+                (provider, item_id),
+            ).fetchone()
+        if not row:
+            raise HTTPException(404, "Not found")
+        try:
+            out = nexus.request("POST", "/resources/resolve", {"resource": row["resource"]})
+        except Exception:
+            return {"availability": "temporarily_unavailable", "open_path": None}
+        availability = out.get("availability") or "unknown"
+        path = (out.get("open") or {}).get("module_path") if availability == "available" else None
+        return {"availability": availability, "open_path": path}
+
     @app.post("/api/projected/plan", status_code=201)
     def plan(body: PlanBody):
         """Create a native Event about a projected item, linked to the owner's resource."""
@@ -1344,6 +1365,14 @@ def create_app(
             (ROOT / "frontend/app.js")
             .read_text(encoding="utf-8")
             .replace("/*CATALOGS*/ {}", json.dumps(catalogs()).replace("<", "\\u003c"))
+        )
+        # Nexus navigation contract: the shared SDK, then Chronos's adapter.
+        script = "\n".join(
+            [
+                script,
+                (ROOT / "frontend/vendor/nexus-navigation.js").read_text(encoding="utf-8"),
+                (ROOT / "frontend/navigation.js").read_text(encoding="utf-8"),
+            ]
         )
         html = (ROOT / "frontend/index.html").read_text(encoding="utf-8")
         return html.replace("/*STYLE*/", style).replace("/*SCRIPT*/", script)
