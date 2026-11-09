@@ -54,6 +54,11 @@ CREATE TABLE projected(provider TEXT NOT NULL, item_id TEXT NOT NULL, resource T
 CREATE INDEX projected_range ON projected(range_start, range_end);
 CREATE TABLE cursors(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 """,
+    # 0.4.0: an event returned by link-search may be labelled for the module that searched (ADR 0029).
+    """
+CREATE TABLE link_grants(event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+ requester TEXT NOT NULL, granted_at TEXT NOT NULL, PRIMARY KEY(event_id, requester));
+""",
 ]
 
 

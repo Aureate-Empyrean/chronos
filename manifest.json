@@ -3,7 +3,7 @@
   "id": "chronos",
   "name": "Chronos",
   "description": "Calendars and events, with read-only iCalendar imports and subscriptions and dates other modules share.",
-  "version": "0.1.1",
+  "version": "0.4.0",
   "publisher": {
     "name": "Aureate Empyrean",
     "originalAuthors": [
@@ -37,7 +37,8 @@
     "produces": [],
     "consumes": [
       "lyra.dated-items.changed",
-      "mnemosyne.resource.changed"
+      "mnemosyne.resource.changed",
+      "meridian.dated-items.changed"
     ]
   },
   "resources": [
@@ -74,12 +75,26 @@
       {
         "module": "mnemosyne",
         "type": "task"
+      },
+      {
+        "module": "meridian",
+        "type": "person"
+      },
+      {
+        "module": "meridian",
+        "type": "interaction"
+      },
+      {
+        "module": "atlas",
+        "type": "place"
       }
     ]
   },
   "projections": {
     "version": 1,
-    "provides": [],
+    "provides": [
+      "link-search"
+    ],
     "read": [
       {
         "module": "lyra",
@@ -88,6 +103,18 @@
       {
         "module": "mnemosyne",
         "projection": "dated-items"
+      },
+      {
+        "module": "meridian",
+        "projection": "dated-items"
+      },
+      {
+        "module": "meridian",
+        "projection": "people-directory"
+      },
+      {
+        "module": "atlas",
+        "projection": "place-directory"
       }
     ]
   },

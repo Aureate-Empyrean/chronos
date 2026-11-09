@@ -16,11 +16,14 @@ class FakeNexus:
         self.calls = []
         self.pages = {}
         self.fail = None
+        self.directory = {"availability": "module_uninstalled"}
 
     def request(self, method, path, body=None):
         self.calls.append((method, path, body))
         if self.fail:
             raise self.fail
+        if path == "/projections/query" and body["projection"] == "people-directory":
+            return self.directory
         if path == "/projections/query":
             pages = self.pages.get(body["module"])
             if pages is None:
@@ -685,3 +688,277 @@ def test_serves_its_application_icon(env):
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("image/svg+xml")
     assert response.text.lstrip().startswith("<svg") and "<script" not in response.text
+
+
+# ── 0.2.0: Meridian dates and people ─────────────────────────────────
+
+PERSON = "nexus:v1:meridian:person:0190f0e4-0000-7000-8000-000000000042"
+
+
+def birthday(item_id, start, **extra):
+    return {
+        "id": item_id,
+        "resource": PERSON,
+        "kind": "meridian.birthday",
+        "title": "Birthday · Vzorko Kvázimenný",
+        "start": start,
+        "all_day": True,
+        "certainty": "confirmed",
+        "status": "scheduled",
+        "summary": "Turns 39",
+        **extra,
+    }
+
+
+def test_meridian_dates_are_opt_in_and_reconciled(env):
+    client, app, nexus, _ = env
+    sources = {s["provider"]: s for s in client.get("/api/state").json()["sources"]}
+    assert sources["meridian"]["enabled"] is False  # owner decision D4: off by default
+    assert "meridian" not in app.state.worker.due_sources()
+    nexus.pages["meridian"] = [([birthday("d1:2026", "2026-08-23")], False)]
+    client.put("/api/sources/meridian", json={"enabled": True})
+    assert "meridian" in app.state.worker.due_sources()
+    assert app.state.worker.reconcile("meridian") == {"ok": True, "items": 1, "invalid": 0}
+    found = [
+        o
+        for o in occurrences(client, "2026-08-01T00:00:00Z", "2026-08-31T00:00:00Z")
+        if o["origin"] == "projection"
+    ]
+    assert [(o["title"], o["start"], o["all_day"], o["provider"]) for o in found] == [
+        ("Birthday · Vzorko Kvázimenný", "2026-08-23", True, "meridian")
+    ]
+    # Meridian may only provide dates about its own resources.
+    foreign = birthday(
+        "x:2026", "2026-08-24", resource="nexus:v1:lyra:movie:0190f0e4-0000-7000-8000-000000000001"
+    )
+    nexus.pages["meridian"] = [([foreign], False)]
+    assert app.state.worker.reconcile("meridian")["invalid"] == 1
+    client.put("/api/sources/meridian", json={"enabled": False})
+    with app.state.db.connect() as conn:
+        assert (
+            conn.execute("SELECT count(*) FROM projected WHERE provider='meridian'").fetchone()[0]
+            == 0
+        )
+
+
+def test_meridian_change_hint_brings_reconciliation_forward(env):
+    client, app, nexus, _ = env
+    client.put("/api/sources/meridian", json={"enabled": True})
+    with app.state.db.connect() as conn:
+        conn.execute("UPDATE sources SET next_attempt=9e12 WHERE provider='meridian'")
+    original = nexus.request
+
+    def request(method, path, body=None):
+        if path.startswith("/events"):
+            nexus.calls.append((method, path, body))
+            return {
+                "events": [{"event": {"type": "meridian.dated-items.changed"}}],
+                "next_cursor": 1,
+            }
+        return original(method, path, body)
+
+    nexus.request = request
+    assert app.state.worker.poll_hints() == {"meridian"}
+
+
+def test_people_on_events_link_resolve_and_enumerate(env):
+    client, app, nexus, _ = env
+    cal = native(client)
+    event = client.post(
+        "/api/events",
+        json={
+            "calendar_id": cal["id"],
+            "title": "Lunch",
+            "start": "2026-11-20T12:00",
+            "end": "2026-11-20T13:00",
+            "time_zone": "Europe/Bratislava",
+        },
+    ).json()
+    # The picker reads Meridian's people-directory through Nexus; names only.
+    nexus.directory = {
+        "availability": "available",
+        "items": [
+            {"id": "x", "resource": PERSON, "label": "Vzorko Kvázimenný", "self": False},
+            {
+                "id": "y",
+                "resource": "nexus:v1:meridian:group:0190f0e4-0000-7000-8000-000000000043",
+                "label": "A group",
+            },
+        ],
+        "next_cursor": None,
+    }
+    found = client.get("/api/people?q=vik").json()
+    assert found == {
+        "availability": "available",
+        "items": [{"resource": PERSON, "label": "Vzorko Kvázimenný", "self": False}],
+    }
+    query = [c for c in nexus.calls if c[1] == "/projections/query"][-1][2]
+    assert query == {
+        "module": "meridian",
+        "projection": "people-directory",
+        "query": {"q": "vik", "limit": 10},
+        "cursor": None,
+    }
+    added = client.post(
+        f"/api/events/{event['id']}/people", json={"resource": PERSON, "label": "Vzorko Kvázimenný"}
+    )
+    assert added.status_code == 201, added.text
+    link = next(x for x in added.json()["links"] if x["relation"] == "chronos.involves")
+    assert link["target"] == PERSON and link["label"] == "Vzorko Kvázimenný"
+    assert (
+        client.post(f"/api/events/{event['id']}/people", json={"resource": PERSON}).status_code
+        == 409
+    )
+    assert (
+        client.post(
+            f"/api/events/{event['id']}/people",
+            json={"resource": "nexus:v1:meridian:group:0190f0e4-0000-7000-8000-000000000043"},
+        ).status_code
+        == 422
+    )
+    app.state.worker.flush(force=True)
+    posted = [c[2] for c in nexus.calls if c[1] == "/references"][-1]
+    assert posted == {
+        "source": event["reference"],
+        "target": PERSON,
+        "relation": "chronos.involves",
+        "metadata": {},
+        "readers": ["meridian"],
+    }
+    links = client.get(f"/api/events/{event['id']}/links").json()["links"]
+    assert links[0]["relation"] == "chronos.involves" and links[0]["label"] == "Live label"
+    # Meridian, as a reader, may resolve the event title for the person's profile.
+    resolved = client.post(
+        "/empyrean/v1/resources/resolve",
+        headers=RES,
+        json={"resource": event["reference"], "requester": "meridian"},
+    )
+    assert resolved.status_code == 200 and resolved.json()["label"] == "Lunch"
+    edges = client.get("/empyrean/v1/references/outgoing", headers=RES).json()["references"]
+    assert [e["relation"] for e in edges] == ["chronos.involves"]
+    client.delete(f"/api/events/{event['id']}/links/{link['id']}")
+    assert client.get(f"/api/events/{event['id']}").json()["links"] == []
+
+
+def test_people_picker_reports_why_it_is_empty(env):
+    client, _, nexus, _ = env
+    assert client.get("/api/people?q=a").json() == {
+        "availability": "module_uninstalled",
+        "items": [],
+    }
+    nexus.directory = {"availability": "not_provided"}
+    assert client.get("/api/people").json()["availability"] == "not_provided"
+    nexus.fail = httpx.ConnectError("down")
+    assert client.get("/api/people").json()["availability"] == "nexus_unreachable"
+
+
+def test_people_cannot_be_added_to_read_only_events(env):
+    client, app, _, _ = env
+    cal = native(client)
+    event = client.post(
+        "/api/events",
+        json={
+            "calendar_id": cal["id"],
+            "title": "Feed copy",
+            "start": "2026-11-20T12:00",
+            "end": "2026-11-20T13:00",
+            "time_zone": "Europe/Bratislava",
+        },
+    ).json()
+    with app.state.db.connect() as conn:  # as if it came from an imported or subscribed calendar
+        conn.execute("UPDATE events SET origin='import' WHERE id=?", (event["id"],))
+    assert (
+        client.post(f"/api/events/{event['id']}/people", json={"resource": PERSON}).status_code
+        == 409
+    )
+    missing = "0190f0e4-0000-7000-8000-0000000000aa"
+    assert (
+        client.post(f"/api/events/{missing}/people", json={"resource": PERSON}).status_code == 404
+    )
+
+
+# ── 0.3.0: backlinks standard and Places from Atlas ────────────────────
+PLACE = "nexus:v1:atlas:place:0190f0e4-0000-7000-8000-00000000000c"
+INTERACTION = "nexus:v1:meridian:interaction:0190f0e4-0000-7000-8000-00000000000d"
+GONE = "nexus:v1:meridian:interaction:0190f0e4-0000-7000-8000-00000000000e"
+
+
+def _lunch(client):
+    return client.post(
+        "/api/events",
+        json={
+            "calendar_id": native(client)["id"],
+            "title": "Lunch",
+            "start": "2026-12-01T12:00",
+            "end": "2026-12-01T13:00",
+            "time_zone": "Europe/Bratislava",
+        },
+    ).json()
+
+
+def test_backlinks_follow_the_standard(env):
+    client, _, nexus, _ = env
+    event = _lunch(client)
+    original = nexus.request
+
+    def request(method, path, body=None):
+        if path.startswith("/references?"):
+            assert "direction=incoming" in path
+            return {
+                "references": [
+                    {"source": INTERACTION, "relation": "meridian.interaction-about"},
+                    {"source": GONE, "relation": "meridian.interaction-about"},
+                    {"source": f"nexus:v1:chronos:event:{event['id']}", "relation": "chronos.self"},
+                ]
+            }
+        if path == "/resources/resolve" and body["resource"] == GONE:
+            return {"availability": "deleted"}
+        return original(method, path, body)
+
+    nexus.request = request
+    got = client.get(f"/api/events/{event['id']}/linked-from").json()
+    assert got["availability"] == "available"
+    assert [(x["module"], x["type"], x["label"], x["availability"]) for x in got["items"]] == [
+        ("meridian", "interaction", "Live label", "available"),
+        ("meridian", "interaction", "", "deleted"),
+    ]
+    nexus.request = original
+    nexus.fail = httpx.ConnectError("down")
+    assert client.get(f"/api/events/{event['id']}/linked-from").json() == {
+        "availability": "nexus_unreachable",
+        "items": [],
+    }
+
+
+def test_a_place_from_atlas_is_linked_and_shared_with_atlas(env):
+    client, app, nexus, _ = env
+    event = _lunch(client)
+    assert client.post(
+        f"/api/events/{event['id']}/places", json={"resource": "nexus:v1:lyra:movie:x", "label": "No"}
+    ).status_code == 422  # fmt: skip
+    added = client.post(f"/api/events/{event['id']}/places", json={"resource": PLACE, "label": "Bistro"})
+    assert added.status_code == 201, added.text
+    link = next(x for x in added.json()["links"] if x["relation"] == "chronos.at")
+    assert link["target"] == PLACE
+    assert client.post(f"/api/events/{event['id']}/places", json={"resource": PLACE, "label": "Bistro"}).status_code == 409
+    out = client.get("/empyrean/v1/references/outgoing", headers=RES).json()["references"]
+    assert [x["readers"] for x in out if x["target"] == PLACE] == [["atlas"]]
+    # Atlas may now read the event's label, because the link is shared with it.
+    resolved = client.post("/empyrean/v1/resources/resolve", headers=RES,
+                           json={"resource": f"nexus:v1:chronos:event:{event['id']}", "requester": "atlas"})  # fmt: skip
+    assert resolved.status_code == 200 and resolved.json()["label"] == "Lunch"
+
+
+def test_link_search_returns_labels_and_grants_only_that_module(env):
+    client, _, _, _ = env
+    event = _lunch(client)
+    ask = lambda q: client.post("/empyrean/v1/projections/link-search", headers=RES, json={"requester": "meridian", "query": {"q": q}})  # noqa: E731
+    assert client.post("/empyrean/v1/projections/link-search", json={"requester": "meridian", "query": {}}).status_code == 403
+    ref = f"nexus:v1:chronos:event:{event['id']}"
+    resolve = lambda who: client.post("/empyrean/v1/resources/resolve", headers=RES, json={"resource": ref, "requester": who})  # noqa: E731
+    assert resolve("meridian").status_code == 403  # nothing shared yet
+    found = ask("lun").json()["items"]
+    assert found == [{"resource": ref, "label": "Lunch · 2026-12-01"}]
+    assert ask("nothing").json()["items"] == []
+    assert resolve("meridian").status_code == 200
+    assert resolve("lyra").status_code == 403

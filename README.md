@@ -30,6 +30,29 @@ Calendars and events for Aureate Empyrean. Canonical architecture: `../architect
 
 Read-only by design: no two-way synchronization, no CalDAV, no reminders yet.
 
+## Added in 0.4.0 (production since 2026-11-09)
+
+A names-only `link-search` projection, and a deep link to one event ([record](../VALIDATION_PHASE5_AETEST_2026-11-09.md)).
+
+## Added in 0.3.0 (production since 2026-11-09)
+
+Add a Place from Atlas to an event (`chronos.at`, shared with `atlas`), and a [Linked from other modules](../architecture/concepts/backlinks.md) section on event details. New reviewed scopes: resolve `atlas:place` and `meridian:interaction`; read Atlas's `place-directory`. No new capability. [Record](../VALIDATION_PHASE4_AETEST_2026-11-09.md).
+
+## Added in 0.2.0 (in production since 2026-11-07 — see `../DEPLOYMENT_PHASE2_EXODUS_2026-11-07.md`)
+
+- **Meridian birthdays and anniversaries** as a shared-date source, **off by default** (Settings → Dates
+  shared by other modules), read through Meridian's `dated-items` projection and refreshed on
+  `meridian.dated-items.changed`. Meridian stays the owner of the dates.
+- **People on events:** a native event can link Meridian People, chosen by name through Meridian's
+  `people-directory` projection (names only). The link is a `chronos.involves` reference that names
+  `meridian` as a reader, so Meridian can list the event on the person's profile; the current name is
+  shown through resolution, and a removed person shows as no longer in Meridian.
+- Both need Meridian 0.6.0 or later; with an older Meridian the source reports its availability and the
+  picker says why it is empty. Checked inside the real Nexus on aetest with Meridian 0.6.0
+  ([record](../VALIDATION_PHASE2_AETEST_2026-11-07.md)).
+- Manifest: reads `meridian`/`dated-items` and `meridian`/`people-directory`, resolves `meridian`/`person`,
+  consumes `meridian.dated-items.changed`. No new capability.
+
 ## iCalendar details
 
 Parsing uses `icalendar` 7; recurrence expansion uses `python-dateutil`. Supported: VEVENT,
@@ -79,9 +102,11 @@ python scripts/manifest.py
 Review and install `manifest.local.json` in Nexus (Modules → Install module), grant the listed
 capabilities and scopes, enable, open `/app/modules/chronos`. Requested permissions:
 full-window application, private data volume, outbound network (subscriptions), event
-subscription (`lyra.dated-items.changed`, `mnemosyne.resource.changed` as hints), references
-(create, read, resolve Lyra titles and Mnemosyne tasks), projection reads (`dated-items` from
-Lyra and Mnemosyne), backup v1. No environment variables or secrets are needed.
+subscription (`lyra.dated-items.changed`, `mnemosyne.resource.changed` and, since 0.2.0,
+`meridian.dated-items.changed` as hints), references (create, read, resolve Lyra titles, Mnemosyne
+tasks and, since 0.2.0, Meridian People), projection reads (`dated-items` from Lyra and Mnemosyne;
+since 0.2.0 `dated-items` and `people-directory` from Meridian), backup v1. 0.2.0 adds no
+capability. No environment variables or secrets are needed.
 
 Module contract: resources `calendar` (not resolvable) and `event` (resolvable to modules an
 event was shared with), Entity References v2 with enumeration, backup v1 (consistent SQLite
@@ -102,7 +127,9 @@ cancelled occurrences, EXDATE, floating and custom zones, missing UIDs, broken c
 re-import), subscription updates/removals/304/empty-feed guard, SSRF refusals (private and
 mapped addresses, metadata IPs, ports, credentials, `.local`, redirects to private hosts, size
 and content checks), address pinning, projection reconciliation (paging, failures keep data,
-invalid and foreign items rejected), Mnemosyne opt-in/opt-out, planning with references,
+invalid and foreign items rejected), Mnemosyne and Meridian opt-in/opt-out, the Meridian change hint,
+people on events (picker, names only, duplicates, read-only events, enumeration, resolution for
+Meridian), planning with references,
 resolver policy, enumeration, backup round trip, the gateway key and the shared design files.
 
 ## Localization

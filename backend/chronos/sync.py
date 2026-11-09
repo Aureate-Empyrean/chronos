@@ -16,9 +16,14 @@ from chronos import ical, net
 from chronos.store import apply_records, normalize_item
 from chronos.util import iso_now
 
-PROVIDERS = {"lyra": "#C98BE0", "mnemosyne": "#8B7CF6"}
-DEFAULT_ENABLED = {"lyra": 1, "mnemosyne": 0}  # Mnemosyne deadlines are opt-in.
-HINTS = {"lyra.dated-items.changed": "lyra", "mnemosyne.resource.changed": "mnemosyne"}
+PROVIDERS = {"lyra": "#C98BE0", "mnemosyne": "#8B7CF6", "meridian": "#E3AE8E"}
+# Mnemosyne deadlines and Meridian birthdays/anniversaries are opt-in (owner decision D4).
+DEFAULT_ENABLED = {"lyra": 1, "mnemosyne": 0, "meridian": 0}
+HINTS = {
+    "lyra.dated-items.changed": "lyra",
+    "mnemosyne.resource.changed": "mnemosyne",
+    "meridian.dated-items.changed": "meridian",
+}
 RECONCILE_SECONDS = 15 * 60
 WINDOW_PAST = 90
 WINDOW_FUTURE = 400

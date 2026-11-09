@@ -6,11 +6,13 @@ import secrets
 import sqlite3
 import threading
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, available_timezones
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -117,6 +119,13 @@ class SourcePatch(Strict):
     enabled: bool | None = None
     color: str | None = Field(default=None, pattern=COLOR)
     show_completed: bool | None = None
+
+
+class PersonBody(Strict):
+    """A Meridian Person chosen in the people picker (people-directory projection)."""
+
+    resource: str = Field(max_length=240)
+    label: str = Field(default="", max_length=200)
 
 
 class PlanBody(Strict):
@@ -658,6 +667,159 @@ def create_app(
             conn.execute("DELETE FROM links WHERE id=?", (lid,))
         return {"deleted": True}
 
+    # ── People (Meridian) ────────────────────────────────────────────
+    # A Person is linked to an event by reference (`chronos.involves`); Meridian stays the
+    # owner of the Person, and is listed as a reader so it can show the event on the profile.
+
+    @app.get("/api/people")
+    def people(q: str = "", limit: int = 10):
+        """Meridian's people-directory projection through Nexus: names only, for the picker."""
+        try:
+            page = nexus.request(
+                "POST",
+                "/projections/query",
+                {
+                    "module": "meridian",
+                    "projection": "people-directory",
+                    "query": {"q": q[:100], "limit": max(1, min(limit, 20))},
+                    "cursor": None,
+                },
+            )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            return {"availability": "not_granted" if status == 403 else "nexus_error", "items": []}
+        except (httpx.HTTPError, KeyError, ValueError):
+            return {"availability": "nexus_unreachable", "items": []}
+        if page.get("availability") != "available":
+            return {"availability": page.get("availability") or "unavailable", "items": []}
+        items = []
+        for item in page.get("items") or []:
+            match = REF.fullmatch(str(item.get("resource", "")))
+            if match and match[1] == "meridian" and match[2] == "person":
+                items.append({"resource": item["resource"], "label": str(item.get("label") or "")[:200],
+                              "self": bool(item.get("self"))})  # fmt: skip
+        return {"availability": "available", "items": items}
+
+    @app.get("/api/events/{eid}/linked-from")
+    def linked_from(eid: str):
+        """Backlinks standard (concepts/backlinks.md): items in other modules that link to this
+        event and share it with Chronos, labelled by their owners. Never raises."""
+        with db.connect() as conn:
+            event_row(conn, eid)
+        try:
+            page = nexus.request("GET", f"/references?resource={reference('event', eid)}&direction=incoming&limit=100")
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            return {"availability": "not_granted" if status == 403 else "nexus_error", "items": []}
+        except (httpx.HTTPError, KeyError, ValueError):
+            return {"availability": "nexus_unreachable", "items": []}
+        items = []
+        for edge in page.get("references") or []:
+            source = edge.get("source", "")
+            match = REF.fullmatch(source)
+            if not match or match[1] == "chronos":
+                continue
+            entry = {"source": source, "module": match[1], "type": match[2], "label": "", "availability": "unknown"}
+            try:
+                out = nexus.request("POST", "/resources/resolve", {"resource": source})
+                entry["availability"] = out.get("availability") or "unknown"
+                if entry["availability"] == "available":
+                    entry["label"] = str(out.get("label") or "")[:200]
+                    entry["open_path"] = (out.get("open") or {}).get("module_path")
+            except Exception:
+                entry["availability"] = "temporarily_unavailable"
+            items.append(entry)
+        return {"availability": "available", "items": items}
+
+    @app.get("/api/places")
+    def places(q: str = "", limit: int = 10):
+        """Atlas's place-directory projection through Nexus: names only, for the picker."""
+        try:
+            page = nexus.request(
+                "POST",
+                "/projections/query",
+                {"module": "atlas", "projection": "place-directory",
+                 "query": {"q": q[:100], "limit": max(1, min(limit, 20))}, "cursor": None},
+            )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            return {"availability": "not_granted" if status == 403 else "nexus_error", "items": []}
+        except (httpx.HTTPError, KeyError, ValueError):
+            return {"availability": "nexus_unreachable", "items": []}
+        if page.get("availability") != "available":
+            return {"availability": page.get("availability") or "unavailable", "items": []}
+        items = []
+        for item in page.get("items") or []:
+            match = REF.fullmatch(str(item.get("resource", "")))
+            if match and match[1] == "atlas" and match[2] == "place":
+                items.append({"resource": item["resource"], "label": str(item.get("label") or "")[:200]})
+        return {"availability": "available", "items": items}
+
+    @app.post("/api/events/{eid}/places", status_code=201)
+    def add_place(eid: str, body: PersonBody):
+        match = REF.fullmatch(body.resource)
+        if not match or match[1] != "atlas" or match[2] != "place":
+            raise HTTPException(422, "Choose a place from Atlas")
+        with db.connect() as conn:
+            row = event_row(conn, eid)
+            if row["origin"] != "native":
+                raise HTTPException(409, "This event is read-only here")
+            if conn.execute(
+                "SELECT 1 FROM links WHERE event_id=? AND target=? AND relation='chronos.at'",
+                (eid, body.resource),
+            ).fetchone():
+                raise HTTPException(409, "This place is already linked")
+            lid = uuid7()
+            readers = ["atlas"]
+            conn.execute(
+                "INSERT INTO links(id,event_id,target,relation,readers,label) VALUES(?,?,?,?,?,?)",
+                (lid, eid, body.resource, "chronos.at", json.dumps(readers), body.label),
+            )
+            queue(
+                conn,
+                "POST",
+                "/references",
+                {"source": reference("event", eid), "target": body.resource, "relation": "chronos.at",
+                 "metadata": {}, "readers": readers},
+                lid,
+            )
+            return event_json(conn, event_row(conn, eid))
+
+    @app.post("/api/events/{eid}/people", status_code=201)
+    def add_person(eid: str, body: PersonBody):
+        match = REF.fullmatch(body.resource)
+        if not match or match[1] != "meridian" or match[2] != "person":
+            raise HTTPException(422, "Choose a person from Meridian")
+        with db.connect() as conn:
+            row = event_row(conn, eid)
+            if row["origin"] != "native":
+                raise HTTPException(409, "This event is read-only here")
+            if conn.execute(
+                "SELECT 1 FROM links WHERE event_id=? AND target=? AND relation='chronos.involves'",
+                (eid, body.resource),
+            ).fetchone():
+                raise HTTPException(409, "This person is already linked")
+            lid = uuid7()
+            readers = ["meridian"]
+            conn.execute(
+                "INSERT INTO links(id,event_id,target,relation,readers,label) VALUES(?,?,?,?,?,?)",
+                (lid, eid, body.resource, "chronos.involves", json.dumps(readers), body.label),
+            )
+            queue(
+                conn,
+                "POST",
+                "/references",
+                {
+                    "source": reference("event", eid),
+                    "target": body.resource,
+                    "relation": "chronos.involves",
+                    "metadata": {},
+                    "readers": readers,
+                },
+                lid,
+            )
+            return event_json(conn, event_row(conn, eid))
+
     @app.get("/api/events/{eid}/links")
     def resolve_links(eid: str):
         """Live owner-provided labels and availability for this event's references."""
@@ -666,7 +828,12 @@ def create_app(
             links = conn.execute("SELECT * FROM links WHERE event_id=?", (eid,)).fetchall()
         results = []
         for link in links:
-            entry = {"id": link["id"], "target": link["target"], "label": link["label"]}
+            entry = {
+                "id": link["id"],
+                "target": link["target"],
+                "label": link["label"],
+                "relation": link["relation"],
+            }
             try:
                 resolved = nexus.request("POST", "/resources/resolve", {"resource": link["target"]})
                 entry["availability"] = resolved.get("availability")
@@ -956,7 +1123,9 @@ def create_app(
             shared = any(
                 body.get("requester") in json.loads(link["readers"])
                 for link in conn.execute("SELECT readers FROM links WHERE event_id=?", (row["id"],))
-            )
+            ) or conn.execute(
+                "SELECT 1 FROM link_grants WHERE event_id=? AND requester=?", (row["id"], body.get("requester"))
+            ).fetchone()
             if not shared:
                 raise HTTPException(403, "Event has not been shared with requester")
             return {
@@ -965,6 +1134,27 @@ def create_app(
                 "open_path": f"/events/{row['id']}",
                 "representation": {"start": row["start"], "all_day": bool(row["all_day"])},
             }
+
+    @app.post("/empyrean/v1/projections/link-search")
+    def link_search(body: dict, request: Request):
+        """Events a module may link (ADR 0029): a reference and a label, nothing else. Nexus
+        allows only modules whose manifest scope the owner reviewed. A result may later be
+        labelled for that module, because this already showed it the same label."""
+        require_resolver(request)
+        query = body.get("query") if isinstance(body.get("query"), dict) else {}
+        limit = max(1, min(int(query.get("limit") or 10) if str(query.get("limit") or 10).isdigit() else 10, 20))
+        folded = lambda v: "".join(c for c in unicodedata.normalize("NFKD", v or "") if not unicodedata.combining(c)).lower()  # noqa: E731
+        tokens = [t for t in folded(str(query.get("q") or "")[:100]).split() if t][:8]
+        requester = str(body.get("requester") or "")
+        with db.connect() as conn:
+            rows = conn.execute("SELECT id, title, start FROM events WHERE status<>'cancelled' ORDER BY start DESC LIMIT 2000").fetchall()
+            found = [r for r in rows if all(t in folded(r["title"]) for t in tokens)][:limit]
+            for r in found:
+                conn.execute("INSERT OR IGNORE INTO link_grants(event_id, requester, granted_at) VALUES(?,?,?)", (r["id"], requester, iso_now()))
+        return {
+            "items": [{"resource": reference("event", r["id"]), "label": f"{r['title']} · {str(r['start'])[:10]}"[:200]} for r in found],
+            "next_cursor": None,
+        }
 
     @app.get("/empyrean/v1/references/outgoing")
     def outgoing(request: Request, limit: int = 200, cursor: str = ""):

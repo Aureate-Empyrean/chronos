@@ -82,6 +82,7 @@ const ICONS = {
   layers: '<path d="m10 3 7 3.8-7 3.8-7-3.8z"/><path d="m3 10.5 7 3.8 7-3.8"/>',
   text: '<path d="M4 5.5h12M4 10h12M4 14.5h8"/>',
   tag: '<path d="M3.5 10.2V4.5a1 1 0 0 1 1-1h5.7l6.3 6.3-6.7 6.7z"/><circle cx="7" cy="7" r="1.1"/>',
+  person: '<circle cx="10" cy="7" r="3"/><path d="M4 17c.8-3.2 3.1-5 6-5s5.2 1.8 6 5"/>',
   film: '<rect x="3.5" y="4" width="13" height="12" rx="2"/><path d="M7 4v12M13 4v12M3.5 8h3.5M3.5 12h3.5M13 8h3.5M13 12h3.5"/>',
   task: '<rect x="4" y="4" width="12" height="12" rx="3"/><path d="m7.3 10.2 1.9 1.9 3.6-3.9"/>',
   info: '<circle cx="10" cy="10" r="7"/><path d="M10 9v4.5M10 6.5h.01"/>',
@@ -125,6 +126,7 @@ const PALETTE = ["#7AA7EB", "#8B7CF6", "#C98BE0", "#E58FC7", "#EF8A8A", "#E8956A
 const PROVIDERS = {
   lyra: { name: "Lyra", icon: "film", what: "Release dates from your media library" },
   mnemosyne: { name: "Mnemosyne", icon: "task", what: "Task deadlines" },
+  meridian: { name: "Meridian", icon: "person", what: "Birthdays and anniversaries" },
 };
 
 const tz = () => state.settings.time_zone || "UTC";
@@ -783,7 +785,13 @@ async function openDetails(key, trigger) {
     if (category) facts.push(`<div class="fact">${icon("tag")}<div><span class="primary" style="color:${esc(category.color)}">${esc(category.name)}</span></div></div>`);
     if (event.location) facts.push(`<div class="fact">${icon("pin")}<div><span class="primary">${esc(event.location)}</span></div></div>`);
     if (event.status !== "confirmed") facts.push(`<div class="fact">${icon("info")}<div><span class="primary">${esc(event.status === "tentative" ? t("Tentative") : t("Cancelled"))}</span></div></div>`);
-    if (event.links.length) facts.push(`<div class="fact">${icon("link")}<div id="links">${event.links.map((l) => `<span class="primary">${esc(l.label || l.target)}</span>`).join("")}<span class="secondary">${esc(t("Checking…"))}</span></div></div>`);
+    const about = event.links.filter((l) => !["chronos.involves", "chronos.at"].includes(l.relation));
+    const people = event.links.filter((l) => l.relation === "chronos.involves");
+    const places = event.links.filter((l) => l.relation === "chronos.at");
+    if (about.length) facts.push(`<div class="fact">${icon("link")}<div id="links">${about.map((l) => `<span class="primary">${esc(l.label || l.target)}</span>`).join("")}<span class="secondary">${esc(t("Checking…"))}</span></div></div>`);
+    if (people.length || !event.readonly) facts.push(peopleFact(event, people));
+    if (places.length || !event.readonly) facts.push(placesFact(event, places));
+    facts.push(`<div class="fact" id="linked-fact" hidden>${icon("link")}<div id="linked-from"></div></div>`);
   }
   const actions = [];
   if (isProjection) {
@@ -804,14 +812,97 @@ async function openDetails(key, trigger) {
       </div>
     </aside>`;
   $(".ae-drawer [data-act=close]").focus();
+  if (event) loadLinkedFrom(event.id);
   if (event?.links.length) {
     const result = await api(`/events/${event.id}/links`).catch(() => null);
     const box = $("#links");
     if (box && result)
       box.innerHTML = result.links
+        .filter((l) => !["chronos.involves", "chronos.at"].includes(l.relation))
         .map((l) => `<span class="primary">${esc(l.label || l.target)}</span><span class="secondary">${esc(l.availability === "available" ? t("Linked item") : l.availability === "deleted" ? t("The linked item was deleted") : t("The linked item is not available right now"))}</span>`)
         .join("");
+    if (result) renderPeople(event, result.links.filter((l) => l.relation === "chronos.involves"));
+    if (result) renderPlaces(event, result.links.filter((l) => l.relation === "chronos.at"));
   }
+}
+/* People on an event: Meridian People linked by reference. Meridian owns them; Chronos keeps
+   only the link (and a last-known name), and shows the current name when Meridian answers. */
+function personRow(event, l, live) {
+  const gone = live && live.availability !== "available";
+  const state = !live ? "" : live.availability === "deleted" ? t("No longer in Meridian") : gone ? t("Meridian is not available right now") : "";
+  const remove = event.readonly ? "" : `<button class="ae-btn ae-btn--quiet ae-btn--icon ae-btn--sm" data-act="remove-person" data-event="${esc(event.id)}" data-id="${esc(l.id)}" aria-label="${esc(t("Remove {name}", { name: (live && live.label) || l.label || t("this person") }))}">${icon("x")}</button>`;
+  return `<div class="person-row${gone ? " is-gone" : ""}"><span class="grow"><span class="primary">${esc((live && live.label) || l.label || t("A person in Meridian"))}</span>${state ? `<span class="secondary">${esc(state)}</span>` : ""}</span>${remove}</div>`;
+}
+function peopleFact(event, people) {
+  const add = event.readonly ? "" : `<div class="person-add"><button class="ae-btn ae-btn--sm" data-act="add-person" data-event="${esc(event.id)}" aria-expanded="false">${icon("plus")}<span>${esc(t("Add a person"))}</span></button>
+    <div class="person-search" hidden><input class="ae-input" type="search" role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="person-results" aria-label="${esc(t("Search people in Meridian"))}" placeholder="${esc(t("Search people in Meridian"))}" maxlength="100" autocomplete="off"><div class="person-results" id="person-results" role="listbox"></div></div></div>`;
+  return `<div class="fact">${icon("person")}<div class="people" id="people"><div id="people-rows">${people.map((l) => personRow(event, l)).join("")}</div>${!people.length && event.readonly ? "" : add}</div></div>`;
+}
+function renderPeople(event, links) {
+  const box = $("#people-rows");
+  if (box) box.innerHTML = links.map((l) => personRow(event, l, l)).join("");
+}
+async function personSearch(event, input) {
+  const box = $("#person-results");
+  const q = input.value.trim();
+  const mine = (personSearch.seq = (personSearch.seq || 0) + 1);
+  const result = await api("/people" + (q ? `?q=${encodeURIComponent(q)}` : "")).catch(() => ({ availability: "nexus_unreachable", items: [] }));
+  if (mine !== personSearch.seq || !box) return;
+  const linked = new Set(event.links.filter((l) => l.relation === "chronos.involves").map((l) => l.target));
+  const items = result.items.filter((p) => !linked.has(p.resource));
+  personSearch.items = items;
+  const why = { not_granted: t("Chronos is not allowed to search Meridian. Review its permissions in Nexus."), module_uninstalled: t("Meridian is not installed."), module_disabled: t("Meridian is stopped."), not_provided: t("This version of Meridian cannot share names yet.") }[result.availability] || t("Meridian is not available right now.");
+  box.innerHTML = result.availability !== "available"
+    ? `<p class="person-empty">${esc(why)}</p>`
+    : items.length
+      ? items.map((p, i) => `<button type="button" class="person-option" role="option" id="person-o${i}" data-act="pick-person" data-index="${i}" data-event="${esc(event.id)}">${icon("person")}<span>${esc(p.label)}</span>${p.self ? `<span class="ae-pill">${esc(t("Me"))}</span>` : ""}</button>`).join("")
+      : `<p class="person-empty">${esc(q ? t("No one in Meridian matches “{q}”.", { q }) : t("No people to add."))}</p>`;
+  input.setAttribute("aria-expanded", "true");
+}
+
+/* Places on an event (0.3.0): Atlas owns the Place; Chronos keeps the link and a last-known name. */
+function placeRow(event, l, live) {
+  const gone = live && live.availability !== "available";
+  const note = !live ? "" : live.availability === "deleted" ? t("No longer in Atlas") : gone ? t("Atlas is not available right now") : "";
+  const remove = event.readonly ? "" : `<button class="ae-btn ae-btn--quiet ae-btn--icon ae-btn--sm" data-act="remove-person" data-event="${esc(event.id)}" data-id="${esc(l.id)}" aria-label="${esc(t("Remove {name}", { name: (live && live.label) || l.label || t("this place") }))}">${icon("x")}</button>`;
+  return `<div class="person-row${gone ? " is-gone" : ""}"><span class="grow"><span class="primary">${esc((live && live.label) || l.label || t("A place in Atlas"))}</span>${note ? `<span class="secondary">${esc(note)}</span>` : ""}</span>${remove}</div>`;
+}
+function placesFact(event, places) {
+  const add = event.readonly ? "" : `<div class="person-add"><button class="ae-btn ae-btn--sm" data-act="add-place" data-event="${esc(event.id)}" aria-expanded="false">${icon("plus")}<span>${esc(t("Add a place"))}</span></button>
+    <div class="person-search place-search" hidden><input class="ae-input" type="search" aria-label="${esc(t("Search places in Atlas"))}" placeholder="${esc(t("Search places in Atlas"))}" maxlength="100" autocomplete="off"><div class="person-results" id="place-results"></div></div></div>`;
+  return `<div class="fact">${icon("pin")}<div class="people"><div id="place-rows">${places.map((l) => placeRow(event, l)).join("")}</div>${!places.length && event.readonly ? "" : add}</div></div>`;
+}
+function renderPlaces(event, links) {
+  const box = $("#place-rows");
+  if (box) box.innerHTML = links.map((l) => placeRow(event, l, l)).join("");
+}
+async function placeSearch(event, input) {
+  const box = $("#place-results");
+  const q = input.value.trim();
+  const mine = (placeSearch.seq = (placeSearch.seq || 0) + 1);
+  const result = await api("/places" + (q ? `?q=${encodeURIComponent(q)}` : "")).catch(() => ({ availability: "nexus_unreachable", items: [] }));
+  if (mine !== placeSearch.seq || !box) return;
+  const linked = new Set(event.links.filter((l) => l.relation === "chronos.at").map((l) => l.target));
+  placeSearch.items = result.items.filter((p) => !linked.has(p.resource));
+  box.innerHTML = result.availability !== "available"
+    ? `<p class="person-empty">${esc(t("Atlas cannot be reached right now."))}</p>`
+    : placeSearch.items.length
+      ? placeSearch.items.map((p, i) => `<button type="button" class="person-option" data-act="pick-place" data-index="${i}" data-event="${esc(event.id)}">${icon("pin")}<span>${esc(p.label)}</span></button>`).join("")
+      : `<p class="person-empty">${esc(q ? t("No place in Atlas matches “{q}”.", { q }) : t("No places to add."))}</p>`;
+}
+/* Backlinks standard (concepts/backlinks.md). */
+const LINKED_KIND = { "meridian:interaction": "Interaction in Meridian", "atlas:place": "Place in Atlas", "mnemosyne:note": "Note in Mnemosyne", "mnemosyne:task": "Task in Mnemosyne", "lyra:movie": "Film in Lyra", "lyra:series": "Series in Lyra" };
+async function loadLinkedFrom(id) {
+  const result = await api(`/events/${id}/linked-from`).catch(() => null);
+  const box = $("#linked-from");
+  if (!box || !result || result.availability !== "available" || !result.items.length) return;
+  box.innerHTML = `<span class="secondary">${esc(t("Linked from other modules"))}</span>` + result.items.map((x) => {
+    const gone = x.availability !== "available";
+    const note = x.availability === "deleted" ? t("deleted there") : ["forbidden", "not_found", "not_resolvable"].includes(x.availability) ? t("not available") : gone ? t("not available right now") : "";
+    const open = !gone && state.context.applications.some((a) => a.id === x.module) ? `<button class="ae-btn ae-btn--quiet ae-btn--icon ae-btn--sm" data-act="open-module" data-module="${esc(x.module)}" data-path="${esc(x.open_path || "")}" aria-label="${esc(t("Open {name}", { name: x.module }))}">${icon("open")}</button>` : "";
+    return `<div class="person-row${gone ? " is-gone" : ""}"><span class="grow"><span class="primary">${esc(gone ? t("Something linked here") : x.label)}</span><span class="secondary">${esc([t(LINKED_KIND[`${x.module}:${x.type}`] || "Linked from another module"), note].filter(Boolean).join(" · "))}</span></span>${open}</div>`;
+  }).join("") + `<span class="secondary">${esc(t("These items belong to their modules."))}</span>`;
+  $("#linked-fact").hidden = false;
 }
 
 /* ───────────────────────── Menus and dialogs ───────────────────────── */
@@ -1255,6 +1346,7 @@ async function settingsDialog() {
   const source = (provider) => state.sources.find((s) => s.provider === provider);
   const lyra = source("lyra");
   const mnemosyne = source("mnemosyne");
+  const meridian = source("meridian") || { enabled: 0 };
   const status = (s) =>
     !s.enabled ? t("Off") : s.availability && s.availability !== "available" ? sourceProblem(s) : s.last_success_at ? `${plural(s.item_count, "{count} date", "{count} dates")} · ${t("updated {when}", { when: relative(s.last_success_at) })}` : t("Connecting…");
   openDialog(
@@ -1268,6 +1360,7 @@ async function settingsDialog() {
       <section class="settings-group"><span class="ae-eyebrow">${esc(t("Dates shared by other modules"))}</span>
         <div class="setting"><div><strong>${esc(t("Lyra release dates"))}</strong><span>${esc(t("Episodes and releases from your media library. Choose which ones in Lyra."))} · ${esc(status(lyra))}</span></div><input type="checkbox" role="switch" class="ae-switch" data-source="lyra" ${lyra.enabled ? "checked" : ""} aria-label="${esc(t("Lyra release dates"))}"></div>
         <div class="setting"><div><strong>${esc(t("Mnemosyne task deadlines"))}</strong><span>${esc(t("Off by default. Shows deadlines of your Tasks as read-only entries; they stay Tasks in Mnemosyne and never become events."))} · ${esc(status(mnemosyne))}</span></div><input type="checkbox" role="switch" class="ae-switch" data-source="mnemosyne" ${mnemosyne.enabled ? "checked" : ""} aria-label="${esc(t("Mnemosyne task deadlines"))}"></div>
+        <div class="setting"><div><strong>${esc(t("Meridian birthdays and anniversaries"))}</strong><span>${esc(t("Off by default. Shows the birthdays and anniversaries recorded in Meridian as read-only yearly dates; Meridian stays their owner."))} · ${esc(status(meridian))}</span></div><input type="checkbox" role="switch" class="ae-switch" data-source="meridian" ${meridian.enabled ? "checked" : ""} aria-label="${esc(t("Meridian birthdays and anniversaries"))}"></div>
         <div class="setting" ${mnemosyne.enabled ? "" : "hidden"} id="completed-row"><div><strong>${esc(t("Show completed tasks"))}</strong></div><input type="checkbox" role="switch" class="ae-switch" id="show-completed" ${mnemosyne.show_completed ? "checked" : ""} aria-label="${esc(t("Show completed tasks"))}"></div>
         <div class="setting"><div><span>${esc(t("Shared dates refresh every 15 minutes and soon after a change is announced."))}</span></div><button class="ae-btn ae-btn--sm" id="refresh-sources">${icon("refresh")}<span>${esc(t("Refresh now"))}</span></button></div>
       </section>
@@ -1468,7 +1561,70 @@ document.addEventListener("click", async (event) => {
       }
     });
   }
-  if (act === "open-module") return bridge("navigate", { module: target.dataset.module }).catch((e) => toast(e.message, "danger"));
+  if (act === "open-module") return bridge("navigate", { module: target.dataset.module, ...(target.dataset.path ? { path: target.dataset.path } : {}) }).catch((e) => toast(e.message, "danger"));
+  if (act === "add-person") {
+    const wrap = target.closest(".person-add");
+    const search = $(".person-search", wrap);
+    search.hidden = !search.hidden;
+    target.setAttribute("aria-expanded", String(!search.hidden));
+    if (search.hidden) return;
+    const input = $("input", search);
+    const event = await attempt(() => api(`/events/${target.dataset.event}`));
+    if (!event) return;
+    let timer;
+    input.oninput = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => personSearch(event, input), 160);
+    };
+    input.onkeydown = (e) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        search.hidden = true;
+        target.setAttribute("aria-expanded", "false");
+        target.focus();
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        $(".person-option", search)?.focus();
+      }
+    };
+    input.focus();
+    return personSearch(event, input);
+  }
+  if (act === "add-place") {
+    const search = $(".place-search", target.closest(".person-add"));
+    search.hidden = !search.hidden;
+    target.setAttribute("aria-expanded", String(!search.hidden));
+    if (search.hidden) return;
+    const input = $("input", search);
+    const event = await attempt(() => api(`/events/${target.dataset.event}`));
+    if (!event) return;
+    let timer;
+    input.oninput = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => placeSearch(event, input), 160);
+    };
+    input.focus();
+    return placeSearch(event, input);
+  }
+  if (act === "pick-place") {
+    const p = (placeSearch.items || [])[Number(target.dataset.index)];
+    if (!p) return;
+    const updated = await attempt(() => api(`/events/${target.dataset.event}/places`, "POST", { resource: p.resource, label: p.label }), t("{name} added", { name: p.label }));
+    if (updated && state.selected) return openDetails(state.selected.key, state.selected.returnFocus);
+    return;
+  }
+  if (act === "pick-person") {
+    const p = (personSearch.items || [])[Number(target.dataset.index)];
+    if (!p) return;
+    const updated = await attempt(() => api(`/events/${target.dataset.event}/people`, "POST", { resource: p.resource, label: p.label }), t("{name} added", { name: p.label }));
+    if (updated && state.selected) return openDetails(state.selected.key, state.selected.returnFocus);
+    return;
+  }
+  if (act === "remove-person") {
+    if (await attempt(() => api(`/events/${target.dataset.event}/links/${target.dataset.id}`, "DELETE"), t("Removed from this event")) && state.selected)
+      return openDetails(state.selected.key, state.selected.returnFocus);
+    return;
+  }
   if (act === "agenda-past" || act === "agenda-upcoming") {
     state.agendaPast = act === "agenda-past";
     state.agendaDays = 60;
@@ -1546,6 +1702,17 @@ async function start() {
   renderSidebar();
   await loadOccurrences();
   schedulePoll();
+  // A link to one event, from another module (open_path of the resolver).
+  const deep = location.pathname.match(/\/events\/([0-9a-f-]{36})$/);
+  if (deep) {
+    const event = await api(`/events/${deep[1]}`).catch(() => null);
+    if (event) {
+      state.cursor = String(event.start).slice(0, 10);
+      await loadOccurrences();
+      const found = state.occurrences.find((o) => o.event_id === deep[1]);
+      if (found) openDetails(found.key);
+    }
+  }
   setInterval(() => {
     if (state.view === "week" || state.view === "day") {
       const line = $(".now-line");
