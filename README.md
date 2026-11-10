@@ -34,6 +34,10 @@ Read-only by design: no two-way synchronization, no CalDAV, no reminders yet.
 
 Deleting one of your own events, one occurrence or a whole series moves it to Trash, with Undo. Trash lists what was deleted and when, with search, restore, and a separately confirmed permanent delete. Nothing leaves Trash automatically. Deleted events disappear from calendars, search, other modules' links and link search, and come back with the same identifiers and relationships. Imported and subscribed events stay read-only and never enter Trash. Details, recurrence rules, integration behaviour, migration and rollback: [`docs/TRASH.md`](docs/TRASH.md).
 
+## Concurrent edits (0.7.0, in development, not deployed)
+
+A save based on an older version of an event, calendar or category is refused instead of overwriting newer data. The editor keeps your changes, shows what is stored now, and lets you decide. Nothing is merged automatically. Details: [`docs/CONCURRENCY.md`](docs/CONCURRENCY.md).
+
 ## Navigation (0.5.0 on aetest)
 
 Calendar views, dates, native events, single occurrences and projected dates are browser history entries through the
@@ -133,7 +137,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements-dev.lock
 node --check frontend/app.js
 ```
 
-Browser journeys for Trash run in a real Nexus shell against a disposable stack: `tests/e2e/trash_e2e.cjs` (usage in its header).
+Browser journeys for Trash run in a real Nexus shell against a disposable stack: `tests/e2e/trash_e2e.cjs` and, for edit conflicts, `tests/e2e/conflict_e2e.cjs` (usage in their headers).
 
 Tests cover DST-correct recurrence, all-day dates, validation, the import matrix (overrides,
 cancelled occurrences, EXDATE, floating and custom zones, missing UIDs, broken components,

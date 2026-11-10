@@ -6,7 +6,7 @@ from pathlib import Path
 
 manifest = json.loads(Path("manifest.json").read_text())
 manifest["container"]["image"] = subprocess.check_output(
-    ["docker", "image", "inspect", "chronos:0.6.0", "--format", "{{.Id}}"], text=True
+    ["docker", "image", "inspect", "chronos:0.7.0", "--format", "{{.Id}}"], text=True
 ).strip()
 Path("manifest.local.json").write_text(json.dumps(manifest, indent=2) + "\n")
 print("Wrote manifest.local.json with the exact locally built image identity.")
