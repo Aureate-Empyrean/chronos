@@ -92,9 +92,18 @@ class Worker:
                 resolver=self.resolver,
             )
             digest = hashlib.sha256(body).hexdigest() if status == 200 else sub["content_hash"]
+            changed = status == 200 and digest != sub["content_hash"]
+            parsed = ical.parse_calendar(body, self.settings()["time_zone"]) if changed else None
             with self.db.connect() as conn:
-                if status == 200 and digest != sub["content_hash"]:
-                    parsed = ical.parse_calendar(body, self.settings()["time_zone"])
+                conn.execute("BEGIN IMMEDIATE")
+                current = conn.execute(
+                    "SELECT url FROM subscriptions WHERE calendar_id=?", (calendar_id,)
+                ).fetchone()
+                if not current or current["url"] != sub["url"]:
+                    # Removed or re-addressed during the fetch: this answer is about the old feed.
+                    conn.rollback()
+                    return self._finish(calendar_id, result)
+                if parsed is not None:
                     existing = conn.execute(
                         "SELECT count(*) FROM events WHERE calendar_id=?", (calendar_id,)
                     ).fetchone()[0]
@@ -143,6 +152,9 @@ class Worker:
                     "WHERE calendar_id=?",
                     (result["error"], failures, time.time() + delay, calendar_id),
                 )
+        return self._finish(calendar_id, result)
+
+    def _finish(self, calendar_id, result):
         with self.db.connect() as conn:
             conn.execute("UPDATE subscriptions SET running=0 WHERE calendar_id=?", (calendar_id,))
         return result

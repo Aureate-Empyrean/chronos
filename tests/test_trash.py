@@ -86,11 +86,24 @@ def edit(client, event, **changes):
         "end": event["end_local"],
         "time_zone": event["time_zone"],
         "rrule": event["rrule"],
+        "expected_revision": client.get(f"/api/events/{event['id']}").json()["revision"],
         **changes,
     }
     response = client.put(f"/api/events/{event['id']}", json=body)
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def generation(client):
+    return client.get("/api/trash").json()["generation"]
+
+
+def delete_calendar(client, calendar_id):
+    calendars = client.get("/api/state").json()["calendars"]
+    revision = next(c["revision"] for c in calendars if c["id"] == calendar_id)
+    return client.delete(
+        f"/api/calendars/{calendar_id}", params={"confirmed": True, "expected_revision": revision}
+    )
 
 
 def rows(app, sql, *params):
@@ -132,8 +145,9 @@ def test_deleted_event_leaves_every_view_and_comes_back_identical(env):
     restored = client.post(f"/api/trash/{item['id']}/restore")
     assert restored.status_code == 200 and restored.json()["restored"] == "event"
     again = client.get(f"/api/events/{event['id']}").json()
-    assert {k: v for k, v in again.items() if k != "links"} == {
-        k: v for k, v in event.items() if k != "links"
+    assert again["revision"] == event["revision"] + 2  # moved to Trash, and back
+    assert {k: v for k, v in again.items() if k not in {"links", "revision"}} == {
+        k: v for k, v in event.items() if k not in {"links", "revision"}
     }
     assert [o["event_id"] for o in occurrences(client, *WIDE)] == [event["id"]]
     assert trash_items(client) == []
@@ -185,7 +199,7 @@ def test_an_event_in_trash_cannot_be_changed(env):
     client.delete(f"/api/events/{event['id']}")
     eid = event["id"]
     assert client.put(f"/api/events/{eid}", json={
-        "calendar_id": event["calendar_id"], "title": "x",
+        "calendar_id": event["calendar_id"], "title": "x", "expected_revision": event["revision"],
         "start": "2026-11-20T10:00", "end": "2026-11-20T11:00",
     }).status_code == 410  # fmt: skip
     assert client.delete(f"/api/events/{eid}").status_code == 410
@@ -254,16 +268,28 @@ def test_empty_trash_has_safeguards_and_keeps_active_events(env):
     client.delete(f"/api/events/{series['id']}", params={"scope": "series"})
     assert len(trash_items(client)) == 3
     assert (
-        client.post("/api/trash/empty", json={"confirmed": False, "expected": 3}).status_code == 422
+        client.post(
+            "/api/trash/empty", json={"confirmed": False, "expected_generation": generation(client)}
+        ).status_code
+        == 422
     )
-    assert client.post("/api/trash/empty", json={"expected": 3}).status_code == 422
     assert (
-        client.post("/api/trash/empty", json={"confirmed": True, "expected": 2}).status_code == 409
+        client.post(
+            "/api/trash/empty", json={"expected_generation": generation(client)}
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            "/api/trash/empty",
+            json={"confirmed": True, "expected_generation": generation(client) - 1},
+        ).status_code
+        == 409
     )
     assert len(trash_items(client)) == 3
-    assert client.post("/api/trash/empty", json={"confirmed": True, "expected": 3}).json() == {
-        "purged": 3
-    }
+    assert client.post(
+        "/api/trash/empty", json={"confirmed": True, "expected_generation": generation(client)}
+    ).json() == {"purged": 3}
     assert trash_items(client) == []
     assert [o["event_id"] for o in occurrences(client, *WIDE)] == [keep["id"]]
     assert rows(app, "SELECT count(*) FROM events")[0][0] == 1
@@ -664,7 +690,7 @@ def test_deleting_a_calendar_keeps_its_events_recoverable(env):
     earlier = single(client, "Earlier", calendar_id=work["id"])
     client.delete(f"/api/events/{earlier['id']}")
     assert client.delete(f"/api/calendars/{work['id']}").status_code == 422  # needs confirmation
-    result = client.delete(f"/api/calendars/{work['id']}?confirmed=true").json()
+    result = delete_calendar(client, work["id"]).json()
     assert result["trash"]["count"] == 2
     state = client.get("/api/state").json()
     assert [c["name"] for c in state["calendars"]] == ["Personal"]
@@ -688,7 +714,7 @@ def test_restoring_one_event_brings_its_calendar_back(env):
     work = second_calendar(client)
     a = single(client, "A", calendar_id=work["id"])
     b = single(client, "B", calendar_id=work["id"])
-    client.delete(f"/api/calendars/{work['id']}?confirmed=true")
+    delete_calendar(client, work["id"])
     entry = next(i for i in trash_items(client) if i["event_id"] == a["id"])
     assert client.post(f"/api/trash/{entry['id']}/restore").json()["calendar_restored"] is True
     assert {c["name"] for c in client.get("/api/state").json()["calendars"]} == {"Personal", "Work"}
@@ -700,21 +726,23 @@ def test_a_deleted_calendar_goes_for_good_with_its_last_event(env):
     client, app, _, _ = env
     work = second_calendar(client)
     single(client, "A", calendar_id=work["id"])
-    client.delete(f"/api/calendars/{work['id']}?confirmed=true")
+    delete_calendar(client, work["id"])
     assert rows(app, "SELECT count(*) FROM calendars WHERE id=?", work["id"])[0][0] == 1
-    client.post("/api/trash/empty", json={"confirmed": True, "expected": 1})
+    client.post(
+        "/api/trash/empty", json={"confirmed": True, "expected_generation": generation(client)}
+    )
     assert rows(app, "SELECT count(*) FROM calendars WHERE id=?", work["id"])[0][0] == 0
     assert rows(app, "SELECT kind FROM tombstones WHERE id=?", work["id"])[0][0] == "calendar"
 
 
 def test_calendar_rules_stay(env):
     client, _, _, _ = env
-    assert client.delete(f"/api/calendars/{native(client)['id']}?confirmed=true").status_code == 409
+    assert delete_calendar(client, native(client)["id"]).status_code == 409
     empty = second_calendar(client)
-    assert client.delete(f"/api/calendars/{empty['id']}?confirmed=true").json() == {"deleted": True}
+    assert delete_calendar(client, empty["id"]).json() == {"deleted": True}
     imported = client.post("/api/import", json={"content": ICS, "filename": "f.ics"}).json()
     cid = imported["calendar"]["id"]
-    assert client.delete(f"/api/calendars/{cid}?confirmed=true").json() == {"deleted": True}
+    assert delete_calendar(client, cid).json() == {"deleted": True}
     assert trash_items(client) == []
 
 
@@ -842,9 +870,10 @@ def digest(conn):
         ("calendars", "id"), ("categories", "id"), ("links", "id"),
         ("link_grants", "event_id,requester"), ("tombstones", "id"),
     ):  # fmt: skip
-        columns = {"calendars": "id,kind,name,color,visible,position,created_at,updated_at"}.get(
-            table, "*"
-        )
+        columns = {
+            "calendars": "id,kind,name,color,visible,position,created_at,updated_at",
+            "categories": "id,name,color,created_at",
+        }.get(table, "*")
         h.update(
             repr(
                 list(map(tuple, conn.execute(f"SELECT {columns} FROM {table} ORDER BY {order}")))
@@ -865,7 +894,7 @@ def test_migration_keeps_every_event_active_and_unchanged(tmp_path):
 
     db = Database(tmp_path / "chronos.sqlite3")
     with db.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS) == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
         assert digest(conn) == before
         assert (
             conn.execute("SELECT count(*) FROM events WHERE trashed_at IS NULL").fetchone()[0] == 3
@@ -935,7 +964,9 @@ def test_backup_carries_trash_and_restore_republishes_only_active_links(env):
         client.post(f"/api/events/{event['id']}/people", json={"resource": PERSON, "label": "Vik"})
     client.delete(f"/api/events/{gone['id']}")
     exported = client.post("/empyrean/v1/backup/export", headers=RES)
-    client.post("/api/trash/empty", json={"confirmed": True, "expected": 1})
+    client.post(
+        "/api/trash/empty", json={"confirmed": True, "expected_generation": generation(client)}
+    )
     headers = _export_headers(exported)
     assert client.post("/empyrean/v1/backup/validate", headers={**RES, **headers},
                        content=exported.content).json() == {"valid": True}  # fmt: skip

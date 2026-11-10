@@ -23,6 +23,7 @@ from chronos import VERSION, ical, net, trash
 from chronos.db import MIGRATIONS, Database
 from chronos.recurrence import validate_native_rule
 from chronos.store import (
+    RevisionError,
     apply_records,
     delete_event,
     edge_body,
@@ -30,6 +31,7 @@ from chronos.store import (
     occurrences,
     projected_json,
     queue,
+    require_revision,
 )
 from chronos.sync import PROVIDERS, Nexus, Worker
 from chronos.util import COLOR, REF, instant, iso_now, now, parse_instant, reference, uuid7
@@ -72,11 +74,16 @@ class CalendarPatch(Strict):
     name: str | None = Field(default=None, min_length=1, max_length=100)
     color: str | None = Field(default=None, pattern=COLOR)
     visible: bool | None = None
+    expected_revision: int | None = Field(default=None, ge=0)
 
 
 class CategoryBody(Strict):
     name: str = Field(min_length=1, max_length=60)
     color: str = Field(pattern=COLOR)
+
+
+class CategoryUpdate(CategoryBody):
+    expected_revision: int | None = Field(default=None, ge=0)
 
 
 class EventBody(Strict):
@@ -93,6 +100,10 @@ class EventBody(Strict):
     status: str = Field(default="confirmed", pattern=r"^(confirmed|tentative|cancelled)$")
     category_id: str | None = None
     color: str = Field(default="", pattern=r"^(#[0-9a-fA-F]{6})?$")
+
+
+class EventUpdate(EventBody):
+    expected_revision: int | None = Field(default=None, ge=0)
 
 
 class ImportBody(Strict):
@@ -114,6 +125,7 @@ class SubscriptionPatch(Strict):
     url: str | None = Field(default=None, min_length=8, max_length=2048)
     enabled: bool | None = None
     refresh_minutes: int | None = None
+    expected_revision: int | None = Field(default=None, ge=0)
 
 
 class SourcePatch(Strict):
@@ -145,7 +157,7 @@ class RestoreBody(Strict):
 
 class EmptyTrashBody(Strict):
     confirmed: bool
-    expected: int = Field(ge=0)
+    expected_generation: int = Field(ge=0)
 
 
 def styles():
@@ -233,6 +245,13 @@ def create_app(
     @app.exception_handler(trash.TrashError)
     async def trash_refused(request: Request, exc: trash.TrashError):
         return JSONResponse({"detail": exc.message}, status_code=exc.status)
+
+    @app.exception_handler(RevisionError)
+    async def revision_refused(request: Request, exc: RevisionError):
+        return JSONResponse(
+            {"detail": exc.message, "code": exc.code, "current_revision": exc.current},
+            status_code=exc.status,
+        )
 
     # ── Helpers ──────────────────────────────────────────────────────
 
@@ -467,9 +486,14 @@ def create_app(
 
     @app.put("/api/calendars/{cid}")
     def update_calendar(cid: str, body: CalendarPatch):
-        changes = body.model_dump(exclude_none=True)
+        changes = body.model_dump(exclude_none=True, exclude={"expected_revision"})
         with db.connect() as conn:
-            calendar(conn, cid)
+            conn.execute("BEGIN IMMEDIATE")
+            row = calendar(conn, cid)
+            # A name or color comes from a form that can be stale; showing or hiding is one switch.
+            if "name" in changes or "color" in changes:
+                require_revision(row, body.expected_revision, "calendar")
+                conn.execute("UPDATE calendars SET revision=revision+1 WHERE id=?", (cid,))
             if "visible" in changes:
                 changes["visible"] = int(changes["visible"])
             for key, value in changes.items():
@@ -479,12 +503,13 @@ def create_app(
             return calendar_json(conn, calendar(conn, cid))
 
     @app.delete("/api/calendars/{cid}")
-    def delete_calendar(cid: str, confirmed: bool = False):
+    def delete_calendar(cid: str, confirmed: bool = False, expected_revision: int | None = None):
         if not confirmed:
             raise HTTPException(422, "Deleting a calendar requires confirmation")
         with db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = calendar(conn, cid)
+            require_revision(row, expected_revision, "calendar")
             if (
                 row["kind"] == "native"
                 and conn.execute(
@@ -501,7 +526,7 @@ def create_app(
                 for event in active:
                     trash.move_event(conn, event, batch, "calendar")
                 conn.execute(
-                    "UPDATE calendars SET trashed_at=?,updated_at=? WHERE id=?",
+                    "UPDATE calendars SET trashed_at=?,updated_at=?,revision=revision+1 WHERE id=?",
                     (iso_now(), iso_now(), cid),
                 )
                 return {"deleted": True, "trash": {"batch": batch, "count": len(active)}}
@@ -531,13 +556,16 @@ def create_app(
             return dict(conn.execute("SELECT * FROM categories WHERE id=?", (cid,)).fetchone())
 
     @app.put("/api/categories/{cid}")
-    def update_category(cid: str, body: CategoryBody):
+    def update_category(cid: str, body: CategoryUpdate):
         with db.connect() as conn:
-            if not conn.execute("SELECT 1 FROM categories WHERE id=?", (cid,)).fetchone():
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM categories WHERE id=?", (cid,)).fetchone()
+            if not row:
                 raise HTTPException(404, "Category not found")
+            require_revision(row, body.expected_revision, "category")
             try:
                 conn.execute(
-                    "UPDATE categories SET name=?,color=? WHERE id=?",
+                    "UPDATE categories SET name=?,color=?,revision=revision+1 WHERE id=?",
                     (body.name.strip(), body.color, cid),
                 )
             except sqlite3.IntegrityError as exc:
@@ -545,8 +573,12 @@ def create_app(
             return dict(conn.execute("SELECT * FROM categories WHERE id=?", (cid,)).fetchone())
 
     @app.delete("/api/categories/{cid}")
-    def delete_category(cid: str):
+    def delete_category(cid: str, expected_revision: int | None = None):
         with db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM categories WHERE id=?", (cid,)).fetchone()
+            if row:
+                require_revision(row, expected_revision, "category")
             conn.execute("DELETE FROM categories WHERE id=?", (cid,))
         return {"deleted": True}
 
@@ -618,7 +650,7 @@ def create_app(
             return event_json(conn, event_row(conn, eid))
 
     @app.put("/api/events/{eid}")
-    def update_event(eid: str, body: EventBody):
+    def update_event(eid: str, body: EventUpdate):
         with db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             old = event_row(conn, eid)
@@ -626,6 +658,7 @@ def create_app(
                 raise HTTPException(
                     409, "Events from imported or subscribed calendars are read-only"
                 )
+            require_revision(old, body.expected_revision)
             values = event_values(conn, body)
             if values["rrule"]:
                 # Skipped occurrences survive edits that keep the start. A reschedule moves every
@@ -641,16 +674,24 @@ def create_app(
                 )
                 values["exdates"] = json.dumps(sorted(skipped))
             assignments = ",".join(f"{column}=?" for column in values)
-            conn.execute(
-                f"UPDATE events SET {assignments},updated_at=? WHERE id=?",
-                (*values.values(), iso_now(), eid),
-            )
+            written = conn.execute(
+                f"UPDATE events SET {assignments},updated_at=?,revision=revision+1 "
+                "WHERE id=? AND revision=?",
+                (*values.values(), iso_now(), eid, body.expected_revision),
+            ).rowcount
+            if written != 1:
+                raise RevisionError(409, "This event changed elsewhere.", "revision_conflict")
             return event_json(conn, event_row(conn, eid))
 
     @app.delete("/api/events/{eid}")
-    def remove_event(eid: str, occurrence: str = "", scope: str = ""):
+    def remove_event(
+        eid: str, occurrence: str = "", scope: str = "", expected_revision: int | None = None
+    ):
         """Move to Trash. A repeating event needs an explicit target: one occurrence, or the
-        whole series with scope=series, so that losing the occurrence can never widen a delete."""
+        whole series with scope=series, so that losing the occurrence can never widen a delete.
+
+        Moving to Trash destroys nothing, so a caller with no revision may still do it; when a
+        revision is sent, as the interface always does, a stale one is refused."""
         with db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = event_row(conn, eid)
@@ -658,6 +699,8 @@ def create_app(
                 raise HTTPException(
                     409, "Events from imported or subscribed calendars are read-only"
                 )
+            if expected_revision is not None:
+                require_revision(row, expected_revision)
             if occurrence:
                 if not row["rrule"]:
                     raise HTTPException(422, "Only repeating events have occurrences")
@@ -690,7 +733,7 @@ def create_app(
             raise HTTPException(422, "Emptying Trash requires confirmation")
         with db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            return trash.empty(conn, body.expected)
+            return trash.empty(conn, body.expected_generation)
 
     @app.post("/api/trash/batches/{batch}/restore")
     def trash_restore_batch(batch: str):
@@ -752,6 +795,7 @@ def create_app(
     @app.delete("/api/events/{eid}/links/{lid}")
     def unlink(eid: str, lid: str):
         with db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             event_row(conn, eid)
             link = conn.execute(
                 "SELECT * FROM links WHERE id=? AND event_id=?", (lid, eid)
@@ -858,6 +902,7 @@ def create_app(
         if not match or match[1] != "atlas" or match[2] != "place":
             raise HTTPException(422, "Choose a place from Atlas")
         with db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = event_row(conn, eid)
             if row["origin"] != "native":
                 raise HTTPException(409, "This event is read-only here")
@@ -888,6 +933,7 @@ def create_app(
         if not match or match[1] != "meridian" or match[2] != "person":
             raise HTTPException(422, "Choose a person from Meridian")
         with db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = event_row(conn, eid)
             if row["origin"] != "native":
                 raise HTTPException(409, "This event is read-only here")
@@ -1004,6 +1050,7 @@ def create_app(
     def import_commit(body: ImportBody):
         parsed = parse_upload(body)
         with db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             stamp = iso_now()
             if body.calendar_id:
                 cid = calendar(conn, body.calendar_id, {"import"})["id"]
@@ -1075,8 +1122,11 @@ def create_app(
     @app.put("/api/subscriptions/{cid}")
     def update_subscription(cid: str, body: SubscriptionPatch):
         with db.connect() as conn:
-            calendar(conn, cid, {"subscription"})
+            conn.execute("BEGIN IMMEDIATE")
+            row = calendar(conn, cid, {"subscription"})
             if body.url is not None:
+                require_revision(row, body.expected_revision, "calendar")
+                conn.execute("UPDATE calendars SET revision=revision+1 WHERE id=?", (cid,))
                 conn.execute(
                     "UPDATE subscriptions SET url=?,etag=NULL,last_modified=NULL,content_hash=NULL,"
                     "failures=0,last_error=NULL,next_attempt=0 WHERE calendar_id=?",

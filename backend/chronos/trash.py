@@ -109,7 +109,9 @@ def move_event(conn, row, batch=None, cause="user"):
     """Move a whole event or series to Trash. Its edges leave the Nexus index; the links stay."""
     kind = "series" if row["rrule"] else "event"
     entry = _insert(conn, kind, row, "", row["start"], row["end"], batch, cause)
-    conn.execute("UPDATE events SET trashed_at=? WHERE id=?", (iso_now(), row["id"]))
+    conn.execute(
+        "UPDATE events SET trashed_at=?,revision=revision+1 WHERE id=?", (iso_now(), row["id"])
+    )
     unpublish_links(conn, row["id"])
     return entry
 
@@ -129,7 +131,7 @@ def move_occurrence(conn, row, key):
         return None  # skipped before Trash existed: already gone, and there is nothing to recover
     entry = _insert(conn, "occurrence", row, key, span[0], span[1], None, "user")
     conn.execute(
-        "UPDATE events SET exdates=?,updated_at=? WHERE id=?",
+        "UPDATE events SET exdates=?,updated_at=?,revision=revision+1 WHERE id=?",
         (json.dumps(sorted(skipped | {key})), iso_now(), row["id"]),
     )
     return entry
@@ -218,6 +220,11 @@ def detail(conn, entry):
     return value
 
 
+def generation(conn):
+    """Changes with every move in or out of Trash: the audit log only ever grows."""
+    return conn.execute("SELECT coalesce(max(seq),0) FROM trash_audit").fetchone()[0]
+
+
 def listing(conn, query, cursor, limit):
     """Newest first. Entry ids are time-ordered, so the id alone is a stable position."""
     clauses, params = [], []
@@ -237,6 +244,7 @@ def listing(conn, query, cursor, limit):
         "items": [entry_json(conn, row) for row in page],
         "matched": matched,
         "total": conn.execute("SELECT count(*) FROM trash").fetchone()[0],
+        "generation": generation(conn),
         "next_cursor": page[-1]["id"] if len(rows) > limit else None,
     }
 
@@ -271,7 +279,7 @@ def _forget_key(conn, event, key):
     skipped = json.loads(event["exdates"])
     if key in skipped:
         conn.execute(
-            "UPDATE events SET exdates=?,updated_at=? WHERE id=?",
+            "UPDATE events SET exdates=?,updated_at=?,revision=revision+1 WHERE id=?",
             (json.dumps([k for k in skipped if k != key]), iso_now(), event["id"]),
         )
 
@@ -334,9 +342,12 @@ def restore(conn, entry, separate=False):
     if entry["kind"] == "occurrence":
         result = _restore_occurrence(conn, entry, event, snapshot, separate)
     else:
-        conn.execute("UPDATE events SET trashed_at=NULL WHERE id=?", (event["id"],))
+        conn.execute(
+            "UPDATE events SET trashed_at=NULL,revision=revision+1 WHERE id=?", (event["id"],)
+        )
         came_back = conn.execute(
-            "UPDATE calendars SET trashed_at=NULL WHERE id=? AND trashed_at IS NOT NULL",
+            "UPDATE calendars SET trashed_at=NULL,revision=revision+1 "
+            "WHERE id=? AND trashed_at IS NOT NULL",
             (event["calendar_id"],),
         ).rowcount
         publish_links(conn, event["id"])
@@ -394,11 +405,11 @@ def purge(conn, entry):
     return {"purged": entry["kind"]}
 
 
-def empty(conn, expected):
-    """Delete everything in Trash for good, if it is still what the owner was shown."""
-    entries = conn.execute("SELECT * FROM trash ORDER BY occurrence='' ").fetchall()
-    if len(entries) != expected:
+def empty(conn, expected_generation):
+    """Delete everything in Trash for good, if it is still exactly what the owner was shown."""
+    if generation(conn) != expected_generation:
         raise TrashError(409, "Trash has changed. Review it and try again.")
+    entries = conn.execute("SELECT * FROM trash ORDER BY occurrence='' ").fetchall()
     stamp = iso_now()
     for entry in entries:
         _purge_one(conn, entry, stamp)

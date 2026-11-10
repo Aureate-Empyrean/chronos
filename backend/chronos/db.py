@@ -80,6 +80,13 @@ CREATE TABLE trash_audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL
  entry_id TEXT NOT NULL, event_id TEXT NOT NULL, occurrence TEXT NOT NULL DEFAULT '',
  batch TEXT NOT NULL DEFAULT '');
 """,
+    # 0.7.0: optimistic concurrency. Additive only; every existing record starts at revision 1.
+    # A write must name the revision it was based on, so a stale client cannot overwrite newer data.
+    """
+ALTER TABLE events ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE calendars ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE categories ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+""",
 ]
 
 

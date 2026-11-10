@@ -24,6 +24,31 @@ EVENT_COLUMNS = (
 )
 
 
+class RevisionError(Exception):
+    """A write that does not name the current revision of what it changes."""
+
+    def __init__(self, status: int, message: str, code: str, current: int | None = None):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.code = code
+        self.current = current
+
+
+def require_revision(row, expected: int | None, noun: str = "event"):
+    """Refuse unless the caller saw the stored revision. Callers hold the write lock."""
+    if expected is None:
+        raise RevisionError(
+            428, f"Reload this {noun} and try again. This change came from an older page.",
+            "revision_required",
+        )
+    if expected != row["revision"]:
+        raise RevisionError(
+            409, f"This {noun} changed elsewhere. Review the current version and try again.",
+            "revision_conflict", row["revision"],
+        )
+
+
 def index_bounds(values: dict) -> tuple[str, str | None]:
     if values["all_day"]:
         start, _ = day_bounds(values["start"], values["end"])
@@ -114,7 +139,7 @@ def apply_records(conn, calendar_id, origin, records, delete_missing):
                 continue
             assignments = ",".join(f"{column}=?" for column in values)
             conn.execute(
-                f"UPDATE events SET {assignments},updated_at=? WHERE id=?",
+                f"UPDATE events SET {assignments},updated_at=?,revision=revision+1 WHERE id=?",
                 (*values.values(), stamp, old["id"]),
             )
             counts["updated"] += 1

@@ -126,6 +126,7 @@ def test_native_timed_event_keeps_zone_and_recurs_across_dst(env):
         "end": "2026-10-19T10:00",
         "time_zone": "Europe/Bratislava",
         "rrule": "FREQ=WEEKLY;COUNT=4",
+        "expected_revision": client.get(f"/api/events/{event['id']}").json()["revision"],
     }
     assert client.put(f"/api/events/{event['id']}", json=body).json()["exdates"] == [
         "2026-10-26T08:30:00Z"
