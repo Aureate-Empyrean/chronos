@@ -1506,3 +1506,243 @@ body {
   padding: 10px 14px;
   margin: 0 0 12px;
 }
+
+/* ── Trash ────────────────────────────────────────────────────────── */
+/* Motion follows Meridian's scale: 120/220/260 ms in, 160 ms out. */
+
+.side-trash {
+  padding: 0 var(--space-3) var(--space-2);
+}
+.side-link {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  min-height: 36px;
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 120ms cubic-bezier(0.22, 1, 0.36, 1), color 120ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.side-link:hover,
+.side-link[aria-current="page"] {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
+}
+.side-link .grow {
+  flex: 1;
+}
+.side-count {
+  color: var(--text-meta);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+.app.in-trash .topbar [data-act="prev"],
+.app.in-trash .topbar [data-act="next"] {
+  display: none;
+}
+
+.trash {
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: var(--space-5) var(--space-5) var(--space-6);
+}
+.trash-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+}
+.trash-head .spacer {
+  flex: 1;
+}
+.trash-lead {
+  margin: 0;
+  color: var(--text-meta);
+  font-size: var(--text-sm);
+}
+.trash-list {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.trash-row {
+  --c: var(--accent);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  border-radius: 14px;
+  overflow: clip;
+  transition: background 120ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.trash-row:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+.trash-open {
+  display: grid;
+  flex: 1;
+  grid-template-columns: 4px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--space-4);
+  min-width: 0;
+  min-height: 56px;
+  padding: 8px var(--space-3);
+  border: 0;
+  border-radius: 14px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+.trash-open .bar {
+  align-self: stretch;
+  border-radius: 4px;
+  background: var(--c);
+  opacity: 0.55;
+}
+.trash-open .main-text {
+  min-width: 0;
+}
+.trash-open .title,
+.trash-open .meta {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.trash-open .title {
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+}
+.trash-open .meta {
+  color: var(--text-meta);
+  font-size: var(--text-sm);
+}
+.trash-open .tags {
+  display: flex;
+  gap: 6px;
+}
+.trash-time {
+  color: var(--text-meta);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+.trash-actions {
+  display: flex;
+  flex: none;
+  gap: 4px;
+  padding-right: var(--space-2);
+}
+.trash-more {
+  margin-top: var(--space-4);
+  text-align: center;
+}
+.trash-notice-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+.trash-drawer .ae-banner {
+  margin-bottom: var(--space-4);
+}
+.trash-danger {
+  color: var(--danger);
+}
+.ae-drawer.trash-drawer {
+  animation-duration: 260ms;
+  animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+}
+.ae-drawer.trash-drawer.is-leaving {
+  animation-duration: 160ms;
+  animation-timing-function: cubic-bezier(0.4, 0, 1, 1);
+}
+.toast-action {
+  flex: none;
+}
+
+.confirm-body p {
+  margin: 0;
+  color: var(--text-2);
+}
+.confirm-body .ae-banner {
+  margin-top: var(--space-3);
+}
+.confirm-body .ae-error-text {
+  margin-top: var(--space-3);
+}
+.confirm-check {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+  color: var(--text);
+  cursor: pointer;
+}
+.confirm-check input {
+  margin-top: 3px;
+}
+.ae-dialog.trash-dialog[open] {
+  animation-duration: 220ms;
+  animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+}
+.ae-dialog.trash-dialog.is-closing {
+  animation: trash-dialog-out 160ms cubic-bezier(0.4, 0, 1, 1) forwards;
+}
+.ae-dialog.trash-dialog.is-closing::backdrop {
+  animation: trash-backdrop-out 160ms cubic-bezier(0.4, 0, 1, 1) forwards;
+}
+@keyframes trash-dialog-out {
+  to {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+@keyframes trash-backdrop-out {
+  to {
+    opacity: 0;
+  }
+}
+
+@media (max-width: 960px) {
+  /* An opened sidebar sits above a retained-draft notice, so Trash stays reachable. */
+  .app.nav-open .sidebar {
+    z-index: 41;
+  }
+}
+@media (max-width: 640px) {
+  .trash {
+    padding: var(--space-3);
+  }
+  .trash-head {
+    flex-wrap: wrap;
+  }
+  .trash-lead {
+    flex-basis: 100%;
+  }
+  .trash-row {
+    flex-wrap: wrap;
+  }
+  .trash-open {
+    flex-basis: 100%;
+    grid-template-columns: 4px minmax(0, 1fr);
+    row-gap: 2px;
+  }
+  .trash-open .tags,
+  .trash-open .trash-time {
+    grid-column: 2;
+  }
+  .trash-actions {
+    width: 100%;
+    justify-content: flex-end;
+    padding: 0 var(--space-2) var(--space-2);
+  }
+}

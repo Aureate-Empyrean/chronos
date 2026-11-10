@@ -5,6 +5,7 @@
      /month|week|day|agenda/<YYYY-MM-DD>        a calendar view on a date
      /events/<id>[?o=<occurrence>&view=&date=]  a native event, one exact occurrence of it
      /projected/<provider>?item=<id>&view=&date= a date another module owns
+     /trash[/<entry-id>]                        Trash, optionally one deleted item's details
 
    Search text, category filters and agenda range are private per-entry view state, and an
    unsaved event editor is a draft. None of them enter the URL. Without a supporting host,
@@ -26,6 +27,9 @@ const ChronosRoutes = {
       return { view: CHRONOS_VIEWS.includes(view) ? view : null, date: validDate(date) ? date : null };
     };
     if (path === "/") return { view: "month", date: null };
+    if (path === "/trash") return { trash: { id: null } };
+    const trash = path.match(/^\/trash\/([0-9a-f-]{36})$/);
+    if (trash) return { trash: { id: trash[1] } };
     const calendar = path.match(/^\/(month|week|day|agenda)\/(\d{4}-\d{2}-\d{2})$/);
     if (calendar && validDate(calendar[2])) return { view: calendar[1], date: calendar[2] };
     const event = path.match(/^\/events\/([0-9a-f-]{36})$/);
@@ -36,6 +40,7 @@ const ChronosRoutes = {
   },
   serialize(route) {
     if (route.notFound) return route.path;
+    if (route.trash) return route.trash.id ? `/trash/${route.trash.id}` : "/trash";
     const context = () => {
       const q = new URLSearchParams();
       if (route.view) q.set("view", route.view);
@@ -73,7 +78,7 @@ function routeForOccurrence(o) {
   return { event: { id: o.event_id, occurrence: o.occurrence || "" }, ...context };
 }
 function routeHasDetail() {
-  return !heldRoute && !!(shownParsed?.event || shownParsed?.projected);
+  return !heldRoute && !!(shownParsed?.event || shownParsed?.projected || shownParsed?.trash?.id);
 }
 function commitRoute(route, mode = "push") {
   queuedRoute = route;
@@ -206,6 +211,7 @@ async function fetchEvent(id) {
   try {
     return await api(`/events/${id}`);
   } catch (error) {
+    if (/in trash/i.test(error.message)) return { inTrash: true };
     if (/not found/i.test(error.message)) return null;
     throw error;
   }
@@ -213,6 +219,19 @@ async function fetchEvent(id) {
 function showNotFound() {
   state.notFound = true;
   state.results = null;
+  state.screen = "calendar";
+  renderView();
+  return "not-found";
+}
+/** A link to something deleted says it is in Trash, and offers the way back. */
+async function showTrashedOr404(ref, isCurrent) {
+  const params = new URLSearchParams({ event_id: ref.id, occurrence: ref.occurrence || "" });
+  const entry = await api(`/trash/lookup?${params}`).catch(() => null);
+  if (!isCurrent()) return undefined;
+  if (!entry) return showNotFound();
+  state.notice = entry;
+  state.results = null;
+  state.screen = "calendar";
   renderView();
   return "not-found";
 }
@@ -221,6 +240,7 @@ async function showRoute(next, message) {
   const view = message?.viewState;
   closeLayerUI();
   state.notFound = false;
+  state.notice = null;
   if (clearSearchOnApply) {
     clearSearchOnApply = false;
     state.results = null;
@@ -228,6 +248,7 @@ async function showRoute(next, message) {
     if ($("#search")) $("#search").value = "";
   }
   if (next.notFound) return showNotFound();
+  if (next.trash) return showTrashRoute(next, message);
   if (view) {
     state.categoryFilter = new Set(view.category || []);
     state.agendaPast = !!view.agendaPast;
@@ -239,8 +260,10 @@ async function showRoute(next, message) {
     event = await fetchEvent(next.event.id);
     if (!isCurrent()) return;
     if (!event) return showNotFound();
+    if (event.inTrash) return showTrashedOr404(next.event, isCurrent);
     date = dayOfEvent(event);
   }
+  state.screen = "calendar";
   state.view = next.view || state.view;
   state.cursor = date || state.cursor || today();
   state.miniCursor = null;
@@ -268,16 +291,36 @@ async function showRoute(next, message) {
       event ??= await fetchEvent(ref.id);
       if (!isCurrent()) return;
       if (!event) return showNotFound();
+      if (event.inTrash) return showTrashedOr404(ref, isCurrent);
       const placedDay = dayOfEvent(event);
       o = { ...event, key: `${event.id}/`, event_id: event.id, sDay: placedDay, eDay: event.all_day ? addDays(event.end, -1) : zoneParts(new Date(event.end)).day, status: event.status };
       state.searchIndex = new Map([...(state.searchIndex || []), [o.key, o]]);
     }
-    if (!o) return showNotFound(); // That exact occurrence no longer exists on this date.
+    if (!o) return showTrashedOr404(ref, isCurrent); // That exact occurrence is not on this date.
     await openDetails(o.key, takeTrigger());
   } else if (next.projected) {
     const key = `${next.projected.provider}:${next.projected.item}`;
     if (!findOccurrence(key)) return showNotFound();
     await openDetails(key, takeTrigger());
+  }
+  if (view?.scroll && $("#view")) $("#view").scrollTop = view.scroll;
+}
+async function showTrashRoute(next, message) {
+  const isCurrent = message?.isCurrent || (() => true);
+  const view = message?.viewState;
+  state.trash.enter = state.trash.enter || state.screen !== "trash";
+  state.screen = "trash";
+  state.results = null;
+  if (view) {
+    state.query = view.query || "";
+    if ($("#search")) $("#search").value = state.query;
+  }
+  await loadTrash({ quiet: state.trash.items.length > 0 });
+  if (!isCurrent()) return;
+  if (next.trash.id) {
+    const opened = await openTrashDetails(next.trash.id, takeTrigger());
+    // A link to something already restored or deleted for good falls back to the list.
+    if (opened === "missing" && isCurrent()) commitRoute({ trash: {} }, "replace");
   }
   if (view?.scroll && $("#view")) $("#view").scrollTop = view.scroll;
 }
@@ -324,7 +367,7 @@ const chronosNavigation = EmpyreanNavigation.createClient({
   },
   beforeLeave: checkpointNow,
   captureView() {
-    if (heldRoute || state.notFound || !state.cursor) return null;
+    if (heldRoute || state.notFound || state.notice || !state.cursor) return null;
     return { scroll: $("#view")?.scrollTop || 0, query: state.query, category: [...state.categoryFilter], agendaPast: state.agendaPast, agendaDays: state.agendaDays };
   },
   onError(error) {

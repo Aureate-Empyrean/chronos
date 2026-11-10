@@ -55,6 +55,9 @@ function animate(el, frames, options) {
   }
 }
 
+/* The motion scale Meridian uses, so a Trash action feels like the rest of Aureate Empyrean. */
+const MOTION = { fast: 120, page: 220, panel: 260, exit: 160, ease: "cubic-bezier(.22,1,.36,1)", exitEase: "cubic-bezier(.4,0,1,1)" };
+
 const ICONS = {
   // Same glyph as frontend/icon.svg, the application icon Nexus shows.
   mark: '<path d="M11.5 4.5a6.5 6.5 0 0 0 8 8 8 8 0 1 1-8-8Z"/><path d="M18.6 2.2c.3 1.7 1.1 2.5 2.8 2.8-1.7.3-2.5 1.1-2.8 2.8-.3-1.7-1.1-2.5-2.8-2.8 1.7-.3 2.5-1.1 2.8-2.8z" fill="currentColor" stroke="none"/>',
@@ -267,17 +270,33 @@ const state = {
   agendaDays: 60,
   selected: null,
   pollTimer: null,
+  screen: "calendar",
+  notice: null,
+  trashCount: 0,
+  trash: { items: [], matched: 0, total: 0, next: null, loading: true, error: null, enter: false },
 };
 const viewsKey = ["month", "week", "day", "agenda"];
 
-function toast(message, tone = "") {
+function toast(message, tone = "", action = null) {
   const box = $("#toasts");
   const el = document.createElement("div");
   el.className = `ae-toast ae-glass ${tone === "danger" ? "ae-toast--danger" : ""}`;
-  el.innerHTML = `<span>${esc(message)}</span><button class="ae-btn ae-btn--quiet ae-btn--icon ae-btn--sm" aria-label="${esc(t("Dismiss"))}">${icon("x")}</button>`;
-  el.querySelector("button").onclick = () => el.remove();
+  el.innerHTML = `<span>${esc(message)}</span>${action ? `<button class="ae-btn ae-btn--sm toast-action" data-toast-action>${esc(action.label)}</button>` : ""}<button class="ae-btn ae-btn--quiet ae-btn--icon ae-btn--sm" data-toast-dismiss aria-label="${esc(t("Dismiss"))}">${icon("x")}</button>`;
+  let leaving = false;
+  const leave = async () => {
+    if (leaving) return;
+    leaving = true;
+    await animate(el, [{ opacity: 1, transform: "none" }, { opacity: 0, transform: "translateY(6px)" }], { duration: MOTION.exit, easing: MOTION.exitEase, fill: "forwards" });
+    el.remove();
+  };
+  el.querySelector("[data-toast-dismiss]").onclick = leave;
+  if (action)
+    el.querySelector("[data-toast-action]").onclick = () => {
+      leave();
+      action.run();
+    };
   box.append(el);
-  setTimeout(() => el.remove(), tone === "danger" ? 9000 : 4500);
+  setTimeout(leave, action ? 10000 : tone === "danger" ? 9000 : 4500);
 }
 async function attempt(work, success) {
   try {
@@ -299,6 +318,7 @@ async function loadState() {
   state.categories = data.categories;
   state.sources = data.sources;
   state.pendingSync = data.pending_sync;
+  state.trashCount = data.trash_count;
 }
 function viewRange() {
   const c = state.cursor;
@@ -364,10 +384,12 @@ function schedulePoll() {
     if (document.hidden) return schedulePoll();
     try {
       const before = JSON.stringify([state.calendars.map((c) => [c.event_count, c.subscription?.last_success_at]), state.sources.map((s) => s.last_success_at)]);
+      const trashBefore = state.trashCount;
       await loadState();
       const after = JSON.stringify([state.calendars.map((c) => [c.event_count, c.subscription?.last_success_at]), state.sources.map((s) => s.last_success_at)]);
       renderSidebar();
       if (before !== after) await loadOccurrences();
+      if (state.screen === "trash" && trashBefore !== state.trashCount) await loadTrash({ quiet: true });
     } catch {
       /* the next poll retries */
     }
@@ -385,6 +407,7 @@ function renderShell() {
       <div class="brand"><span class="brand-mark">${icon("mark")}</span><span class="brand-name">Chronos</span></div>
       <button class="ae-btn ae-btn--primary new-event" data-act="new">${icon("plus")}<span>${esc(t("New event"))}</span></button>
       <div class="sidebar-scroll" id="sidebar"></div>
+      <div class="side-trash" id="side-trash"></div>
       <div class="side-foot">
         <button class="ae-btn ae-btn--quiet ae-btn--sm" data-act="import">${icon("upload")}<span>${esc(t("Import"))}</span></button>
         <button class="ae-btn ae-btn--quiet ae-btn--sm" data-act="subscribe">${icon("feed")}<span>${esc(t("Subscribe"))}</span></button>
@@ -479,6 +502,7 @@ function renderSidebar() {
           : `<p class="ae-meta" style="padding:0 var(--space-2);margin:0">${esc(t("Group events by what they are about."))}</p>`
       }
     </section>`;
+  $("#side-trash").innerHTML = `<button class="side-link" data-act="trash" ${state.screen === "trash" ? 'aria-current="page"' : ""}>${icon("trash")}<span class="grow">${esc(t("Trash"))}</span>${state.trashCount ? `<span class="side-count">${state.trashCount}</span>` : ""}</button>`;
 }
 function sourceProblem(source) {
   return (
@@ -495,6 +519,7 @@ function sourceProblem(source) {
 
 function titleText() {
   const c = state.cursor;
+  if (state.screen === "trash") return `<span class="t-main">${esc(t("Trash"))}</span>`;
   if (state.results) return esc(t("Search"));
   if (state.view === "month")
     return `<span class="t-main">${esc(fmtDay(c, { month: "long" }))}</span> <span class="sub">${esc(fmtDay(c, { year: "numeric" }))}</span>`;
@@ -511,9 +536,15 @@ function titleText() {
 
 function renderView() {
   $("#title").innerHTML = titleText();
-  $$(".views button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.view === state.view && !state.results)));
+  const inTrash = state.screen === "trash";
+  $$(".views button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.view === state.view && !state.results && !inTrash && !state.notice)));
+  $("#app").classList.toggle("in-trash", inTrash);
+  const search = $("#search");
+  if (search) search.placeholder = inTrash ? t("Search Trash") : t("Search events");
   const view = $("#view");
   if (state.notFound) return (view.innerHTML = `<div class="ae-empty">${icon("alert")}<h3>${esc(t("This page could not be found"))}</h3><p>${esc(t("The address may be wrong, or the event may have been removed."))}</p><button class="ae-btn" data-act="today">${esc(t("Today"))}</button></div>`);
+  if (state.notice) return renderTrashNotice(view);
+  if (inTrash) return renderTrash(view);
   if (state.results) return renderResults(view);
   if (state.error)
     return (view.innerHTML = `<div class="ae-banner ae-banner--danger view-error">${icon("alert")}<div><strong>${esc(t("Events could not be loaded."))}</strong><br>${esc(state.error)}</div><button class="ae-btn ae-btn--sm" data-act="reload">${esc(t("Try again"))}</button></div>`);
@@ -675,6 +706,10 @@ let searchTimer;
 function onSearch(event) {
   state.query = event.target.value;
   clearTimeout(searchTimer);
+  if (state.screen === "trash") {
+    searchTimer = setTimeout(() => loadTrash({ quiet: true }), 220);
+    return;
+  }
   searchTimer = setTimeout(async () => {
     if (state.query.trim().length < 2) {
       state.results = null;
@@ -716,7 +751,7 @@ function findOccurrence(key) {
  * replace when an action made the record go away. */
 function closeLayer({ mode = "push" } = {}) {
   closeLayerUI();
-  if (chronosNavigation.enabled && routeHasDetail()) commitRoute(calendarRoute(), mode);
+  if (chronosNavigation.enabled && routeHasDetail()) commitRoute(shownParsed?.trash ? { trash: {} } : calendarRoute(), mode);
 }
 let detailSerial = 0;
 function closeLayerUI() {
@@ -920,6 +955,329 @@ async function loadLinkedFrom(id) {
   $("#linked-fact").hidden = false;
 }
 
+/* ───────────────────────── Trash ───────────────────────── */
+
+const fmtMoment = (instant) =>
+  new Intl.DateTimeFormat(activeLocale, { timeZone: tz(), year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", ...hourOptions() }).format(new Date(instant));
+
+async function rerunSearch() {
+  if (!state.results || state.query.trim().length < 2) return;
+  state.results = await api("/search?q=" + encodeURIComponent(state.query.trim())).catch(() => state.results);
+}
+async function afterTrashChange() {
+  if (state.screen === "trash") await loadTrash({ quiet: true });
+  await rerunSearch();
+  await refresh();
+}
+
+/* A confirmation for moving to Trash or deleting for good. `check` must be ticked first. */
+function trashConfirm({ title, text, notes = [], label, check, safeFocus = false, run }) {
+  openDialog(`<div class="ae-dialog-head"><h2>${esc(title)}</h2></div>
+    <div class="ae-dialog-body confirm-body"><p>${esc(text)}</p>${notes.map((n) => `<div class="ae-banner ae-banner--warn">${icon("alert")}<div>${esc(n)}</div></div>`).join("")}${check ? `<label class="confirm-check"><input type="checkbox" id="confirm-check"><span>${esc(check)}</span></label>` : ""}<p class="ae-error-text" id="confirm-error" hidden></p></div>
+    <div class="ae-dialog-foot"><button class="ae-btn" data-act="dialog-cancel" ${safeFocus ? "autofocus" : ""}>${esc(t("Cancel"))}</button><button class="ae-btn ae-btn--danger" id="confirm" ${check ? "disabled" : ""} ${safeFocus ? "" : "autofocus"}>${esc(label)}</button></div>`);
+  const d = dialog();
+  d.classList.add("trash-dialog");
+  if (check) $("#confirm-check", d).onchange = (event) => ($("#confirm", d).disabled = !event.target.checked);
+  $("#confirm", d).onclick = async (event) => {
+    const button = event.currentTarget;
+    button.classList.add("is-busy");
+    button.disabled = true;
+    try {
+      await run();
+    } catch (error) {
+      button.classList.remove("is-busy");
+      button.disabled = false;
+      const box = $("#confirm-error", d);
+      if (box) {
+        box.textContent = error.message;
+        box.hidden = false;
+      }
+    }
+  };
+}
+
+let trashSerial = 0;
+async function loadTrash({ more = false, quiet = false } = {}) {
+  const token = ++trashSerial;
+  const box = state.trash;
+  if (!more && !quiet && !box.items.length) {
+    box.loading = true;
+    renderView();
+  }
+  const params = new URLSearchParams({ q: state.query.trim() });
+  if (more && box.next) params.set("cursor", box.next);
+  try {
+    const data = await api(`/trash?${params}`);
+    if (token !== trashSerial) return;
+    box.items = more ? [...box.items, ...data.items] : data.items;
+    box.matched = data.matched;
+    box.total = data.total;
+    box.next = data.next_cursor;
+    box.error = null;
+    state.trashCount = data.total;
+  } catch (error) {
+    if (token !== trashSerial) return;
+    box.error = error.message;
+  }
+  box.loading = false;
+  renderView();
+}
+function openTrash() {
+  state.trash.enter = state.screen !== "trash";
+  if (chronosNavigation.enabled) {
+    if (state.screen !== "trash") clearSearchOnApply = true;
+    return commitRoute({ trash: {} });
+  }
+  state.screen = "trash";
+  state.results = null;
+  state.notice = null;
+  state.query = "";
+  if ($("#search")) $("#search").value = "";
+  return loadTrash();
+}
+function openTrashEntry(id, trigger) {
+  if (!chronosNavigation.enabled) return openTrashDetails(id, trigger);
+  pendingTrigger = trigger;
+  return commitRoute({ trash: { id } });
+}
+function trashPills(entry) {
+  const pills = [];
+  if (entry.kind === "series") pills.push(`<span class="ae-pill">${esc(t("Series"))}</span>`);
+  if (entry.kind === "occurrence") pills.push(`<span class="ae-pill">${esc(t("One occurrence"))}</span>`);
+  if (entry.cause === "calendar") pills.push(`<span class="ae-pill ae-pill--warn">${esc(t("Calendar deleted"))}</span>`);
+  return pills.join("");
+}
+function trashRow(entry) {
+  const restoreButton =
+    entry.blocked === "series_in_trash"
+      ? `<button class="ae-btn ae-btn--sm" disabled data-tip="${esc(t("Restore the series first"))}">${esc(t("Restore"))}</button>`
+      : entry.blocked === "occurrence_gone"
+        ? `<button class="ae-btn ae-btn--sm" data-act="trash-open" data-id="${esc(entry.id)}">${esc(t("Options"))}</button>`
+        : `<button class="ae-btn ae-btn--sm" data-act="trash-restore" data-id="${esc(entry.id)}" aria-label="${esc(t("Restore {name}", { name: entry.title }))}">${esc(t("Restore"))}</button>`;
+  return `<li class="trash-row" data-row="${esc(entry.id)}" style="--c:${esc(entry.color)}">
+    <button class="trash-open" data-act="trash-open" data-id="${esc(entry.id)}">
+      <span class="bar"></span>
+      <span class="main-text"><span class="title">${esc(entry.title)}</span><span class="meta">${esc([whenText(entry), entry.calendar.name].join(" · "))}</span></span>
+      <span class="tags">${trashPills(entry)}</span>
+      <span class="trash-time" title="${esc(fmtMoment(entry.deleted_at))}">${esc(t("Deleted {when}", { when: relative(entry.deleted_at) }))}</span>
+    </button>
+    <span class="trash-actions">${restoreButton}<button class="ae-btn ae-btn--quiet ae-btn--icon ae-btn--sm" data-act="trash-purge" data-id="${esc(entry.id)}" aria-label="${esc(t("Delete {name} for good", { name: entry.title }))}" data-tip="${esc(t("Delete for good"))}">${icon("trash")}</button></span>
+  </li>`;
+}
+function renderTrash(view) {
+  renderSidebar();
+  const box = state.trash;
+  if (box.error && !box.items.length) {
+    view.innerHTML = `<div class="ae-banner ae-banner--danger view-error">${icon("alert")}<div><strong>${esc(t("Trash could not be loaded."))}</strong><br>${esc(box.error)}</div><button class="ae-btn ae-btn--sm" data-act="trash-retry">${esc(t("Try again"))}</button></div>`;
+    return;
+  }
+  if (box.loading && !box.items.length) {
+    view.innerHTML = skeleton();
+    return;
+  }
+  const query = state.query.trim();
+  const summary = query
+    ? plural(box.matched, "{count} match in Trash", "{count} matches in Trash")
+    : box.total
+      ? `${plural(box.total, "{count} deleted item", "{count} deleted items")} · ${t("Kept until you restore or delete them.")}`
+      : "";
+  const body = !box.total
+    ? `<div class="ae-empty">${icon("trash")}<h3>${esc(t("Trash is empty"))}</h3><p>${esc(t("Events you delete stay here until you restore them or delete them for good."))}</p></div>`
+    : !box.items.length
+      ? `<div class="ae-empty">${icon("search")}<h3>${esc(t("Nothing in Trash matches “{query}”", { query }))}</h3><p>${esc(t("Search covers titles, places, descriptions and calendar names."))}</p></div>`
+      : `<ul class="trash-list">${box.items.map(trashRow).join("")}</ul>${box.next ? `<div class="trash-more"><button class="ae-btn ae-btn--quiet" data-act="trash-more">${esc(t("Show more"))}</button></div>` : ""}`;
+  view.innerHTML = `<div class="trash">
+    <div class="trash-head"><p class="trash-lead" role="status">${esc(summary)}</p><span class="spacer"></span>
+      <button class="ae-btn ae-btn--quiet ae-btn--sm" data-act="back-calendar">${icon("left")}<span>${esc(t("Back to calendar"))}</span></button>
+      ${box.total ? `<button class="ae-btn ae-btn--sm ae-btn--danger" data-act="trash-empty">${esc(t("Empty Trash"))}</button>` : ""}</div>
+    ${body}
+  </div>`;
+  if (box.enter) {
+    box.enter = false;
+    animate($(".trash", view), [{ opacity: 0, transform: "translateY(6px)" }, { opacity: 1, transform: "none" }], { duration: MOTION.page, easing: MOTION.ease });
+  }
+}
+/** The screen for a link to something that is in Trash: say so, and offer the way back. */
+function renderTrashNotice(view) {
+  renderSidebar();
+  const entry = state.notice;
+  view.innerHTML = `<div class="ae-empty trash-notice">${icon("trash")}
+    <h3>${esc(entry.kind === "occurrence" ? t("This occurrence is in Trash") : t("This event is in Trash"))}</h3>
+    <p>${esc(t("“{name}” was deleted {when}. It stays recoverable until it is deleted for good.", { name: entry.title, when: relative(entry.deleted_at) }))}</p>
+    <div class="trash-notice-actions">
+      ${entry.blocked ? "" : `<button class="ae-btn ae-btn--primary" data-act="notice-restore" data-id="${esc(entry.id)}">${esc(t("Restore"))}</button>`}
+      <button class="ae-btn" data-act="trash-open" data-id="${esc(entry.id)}">${esc(t("View in Trash"))}</button>
+      <button class="ae-btn ae-btn--quiet" data-act="back-calendar">${esc(t("Back to calendar"))}</button>
+    </div>
+  </div>`;
+  animate($(".trash-notice", view), [{ opacity: 0, transform: "translateY(6px)" }, { opacity: 1, transform: "none" }], { duration: MOTION.page, easing: MOTION.ease });
+}
+async function noticeRestore(id) {
+  const result = await restoreEntry(id);
+  if (!result) return;
+  state.notice = null;
+  if (chronosNavigation.enabled && shownParsed) return showRoute(shownParsed, null);
+  renderView();
+}
+function restoredMessage(result) {
+  if (result.separate) return t("Restored as a separate event");
+  if (result.calendar_restored) return t("Restored, together with its calendar");
+  return { occurrence: t("Occurrence restored"), series: t("Series restored") }[result.restored] || t("Event restored");
+}
+function showRestored(result) {
+  const day = result.all_day ? result.start : zoneParts(new Date(result.start)).day;
+  if (chronosNavigation.enabled) return commitRoute({ event: { id: result.event_id, occurrence: result.occurrence || "" }, view: state.view, date: day });
+  state.screen = "calendar";
+  state.cursor = day;
+  return loadOccurrences();
+}
+/** The same restore serves Undo, the Trash list, its details and a link to a deleted event. */
+async function restoreEntry(id, body = {}, leave = null) {
+  try {
+    const result = await api(`/trash/${id}/restore`, "POST", body);
+    await leave?.();
+    toast(restoredMessage(result), "", { label: t("Show"), run: () => showRestored(result) });
+    await afterTrashChange();
+    return result;
+  } catch (error) {
+    toast(error.message, "danger");
+    await afterTrashChange();
+    return null;
+  }
+}
+async function restoreBatch(batch) {
+  try {
+    const result = await api(`/trash/batches/${batch}/restore`, "POST");
+    if ($(".ae-drawer") && state.screen === "trash") closeLayer({ mode: "replace" });
+    toast(plural(result.restored, "{count} event restored", "{count} events restored"));
+    await afterTrashChange();
+  } catch (error) {
+    toast(error.message, "danger");
+  }
+}
+/** Collapse a row out of the list, then hand focus to what took its place. */
+function rowLeaves(row) {
+  if (!row) return Promise.resolve();
+  const height = row.offsetHeight;
+  return animate(row, [{ opacity: 1, height: `${height}px` }, { opacity: 0, height: "0px" }], { duration: MOTION.exit, easing: MOTION.exitEase, fill: "forwards" });
+}
+function focusAfterRemoval(index) {
+  const rows = $$(".trash-open");
+  (rows[Math.min(index, rows.length - 1)] || $(".trash-head .ae-btn") || $("#view"))?.focus?.();
+}
+async function trashRestoreRow(id, target, body = {}) {
+  const row = $(`.trash-row[data-row="${CSS.escape(id)}"]`);
+  const index = $$(".trash-row").indexOf(row);
+  target.classList.add("is-busy");
+  target.disabled = true;
+  const inDrawer = !!target.closest(".ae-drawer");
+  const result = await restoreEntry(id, body, async () => {
+    if (inDrawer) closeLayer({ mode: "replace" });
+    await rowLeaves(row);
+  });
+  if (!result) {
+    target.classList.remove("is-busy");
+    target.disabled = false;
+    return;
+  }
+  if (state.screen === "trash") focusAfterRemoval(index);
+}
+async function trashPurge(id) {
+  const entry = await attempt(() => api(`/trash/${id}`));
+  if (!entry) return;
+  const notes = [];
+  if (entry.occurrences_in_trash) notes.push(plural(entry.occurrences_in_trash, "Its {count} deleted occurrence goes with it.", "Its {count} deleted occurrences go with it."));
+  if (entry.kind !== "occurrence") {
+    const linked = await api(`/events/${entry.event_id}/linked-from`).catch(() => null);
+    if (!linked || linked.availability !== "available") notes.push(t("Chronos could not check whether other modules link to this event."));
+    else if (linked.items.length) notes.push(plural(linked.items.length, "{count} item in another module links to this event. It will show as deleted there.", "{count} items in other modules link to this event. It will show as deleted there."));
+  }
+  trashConfirm({
+    title: t("Delete “{name}” for good?", { name: entry.title }),
+    text: entry.kind === "occurrence" ? t("This occurrence can no longer be restored and stays off the series. The rest of the series is not affected.") : t("This cannot be undone. Everything about this event is removed from Chronos."),
+    notes,
+    label: t("Delete for good"),
+    safeFocus: true,
+    run: async () => {
+      const row = $(`.trash-row[data-row="${CSS.escape(id)}"]`);
+      const index = $$(".trash-row").indexOf(row);
+      await api(`/trash/${id}?confirmed=true`, "DELETE");
+      await leaveDialog();
+      if ($(".ae-drawer") && state.screen === "trash") closeLayer({ mode: "replace" });
+      await rowLeaves(row);
+      toast(t("Deleted for good"));
+      await afterTrashChange();
+      if (state.screen === "trash") focusAfterRemoval(index);
+    },
+  });
+}
+function trashEmpty() {
+  const count = state.trash.total;
+  trashConfirm({
+    title: t("Empty Trash?"),
+    text: plural(count, "{count} deleted item is removed for good. This cannot be undone.", "All {count} deleted items are removed for good. This cannot be undone."),
+    check: t("I understand that these items cannot be recovered."),
+    label: t("Empty Trash"),
+    safeFocus: true,
+    run: async () => {
+      try {
+        await api("/trash/empty", "POST", { confirmed: true, expected: count });
+      } catch (error) {
+        await loadTrash({ quiet: true });
+        throw error;
+      }
+      await leaveDialog();
+      toast(t("Trash emptied"));
+      await afterTrashChange();
+    },
+  });
+}
+async function openTrashDetails(id, trigger) {
+  const serial = ++detailSerial;
+  state.selected = { key: `trash:${id}`, returnFocus: trigger };
+  let entry;
+  try {
+    entry = await api(`/trash/${id}`);
+  } catch (error) {
+    if (serial !== detailSerial) return "stale";
+    state.selected = null;
+    toast(error.message, "danger");
+    return "missing";
+  }
+  if (serial !== detailSerial) return "stale";
+  const facts = [];
+  facts.push(`<div class="fact">${icon("clock")}<div><span class="primary">${esc(whenText(entry))}</span>${entry.rrule ? `<span class="secondary">${esc(ruleText(entry.rrule, entry.start))}</span>` : ""}${entry.kind === "occurrence" ? `<span class="secondary">${esc(t("One occurrence of a repeating event"))}</span>` : ""}</div></div>`);
+  facts.push(`<div class="fact">${icon("trash")}<div><span class="primary">${esc(t("Deleted {when}", { when: relative(entry.deleted_at) }))}</span><span class="secondary">${esc(fmtMoment(entry.deleted_at))}</span></div></div>`);
+  facts.push(`<div class="fact">${icon("calendar")}<div><span class="primary">${esc(entry.calendar.name)}</span>${entry.calendar.deleted ? `<span class="secondary">${esc(t("This calendar was deleted too. Restoring brings it back."))}</span>` : ""}</div></div>`);
+  if (entry.category_name) facts.push(`<div class="fact">${icon("tag")}<div><span class="primary">${esc(entry.category_name)}</span></div></div>`);
+  if (entry.location) facts.push(`<div class="fact">${icon("pin")}<div><span class="primary">${esc(entry.location)}</span></div></div>`);
+  if (entry.links.length) facts.push(`<div class="fact">${icon("link")}<div>${entry.links.map((l) => `<span class="primary">${esc(l.label || l.target)}</span>`).join("")}<span class="secondary">${esc(t("These links come back when it is restored."))}</span></div></div>`);
+  facts.push(`<div class="fact">${icon("info")}<div><span class="secondary">${esc(t("Created {created} · last changed {changed}", { created: fmtMoment(entry.created_at), changed: fmtMoment(entry.updated_at) }))}</span></div></div>`);
+  const banner =
+    entry.blocked === "series_in_trash"
+      ? `<div class="ae-banner ae-banner--warn">${icon("info")}<div>${esc(t("The series this belongs to is in Trash. Restore the series first."))}</div></div>`
+      : entry.blocked === "occurrence_gone"
+        ? `<div class="ae-banner ae-banner--warn">${icon("info")}<div>${esc(t("The series was rescheduled after this was deleted, so this occurrence no longer exists in it. You can bring it back as a separate event."))}</div></div>`
+        : "";
+  const primary =
+    entry.blocked === "series_in_trash"
+      ? `<button class="ae-btn ae-btn--primary" disabled>${esc(t("Restore"))}</button>`
+      : entry.blocked === "occurrence_gone"
+        ? `<button class="ae-btn ae-btn--primary" data-act="trash-restore-separate" data-id="${esc(entry.id)}">${esc(t("Restore as separate event"))}</button>`
+        : `<button class="ae-btn ae-btn--primary" data-act="trash-restore" data-id="${esc(entry.id)}">${esc(t("Restore"))}</button>`;
+  const batch = entry.cause === "calendar" && entry.batch_size > 1 ? `<button class="ae-btn" data-act="trash-restore-batch" data-batch="${esc(entry.batch)}">${esc(plural(entry.batch_size, "Restore {count} from this calendar", "Restore all {count} from this calendar"))}</button>` : "";
+  $("#layer").innerHTML = `<div class="ae-scrim" data-act="close"></div>
+    <aside class="ae-drawer ae-glass trash-drawer" style="--c:${esc(entry.color)}" role="dialog" aria-modal="true" aria-labelledby="details-title">
+      <div class="details">
+        <div class="details-head"><span class="swatch" style="--c:${esc(entry.color)}"></span><h2 id="details-title">${esc(entry.title)}</h2><button class="ae-btn ae-btn--quiet ae-btn--icon ae-btn--sm" data-act="close" aria-label="${esc(t("Close"))}">${icon("x")}</button></div>
+        <div class="details-body">${banner}<div class="facts">${facts.join("")}</div>${entry.description ? `<p class="description">${esc(entry.description)}</p>` : ""}</div>
+        <div class="details-foot">${primary}${batch}<span class="grow"></span><button class="ae-btn ae-btn--quiet trash-danger" data-act="trash-purge" data-id="${esc(entry.id)}">${esc(t("Delete for good"))}</button></div>
+      </div>
+    </aside>`;
+  $(".ae-drawer [data-act=close]").focus();
+  return "open";
+}
+
 /* ───────────────────────── Menus and dialogs ───────────────────────── */
 
 function openMenu(anchor, items) {
@@ -983,6 +1341,21 @@ function openDialog(html, { wide = false, onOpen } = {}) {
 function closeDialog() {
   if (dialog().open) dialog().close();
 }
+/** Close a Trash dialog with its exit motion; any other dialog closes at once, as before. */
+async function leaveDialog() {
+  const d = dialog();
+  if (!d.open) return;
+  if (!d.classList.contains("trash-dialog") || reducedMotion()) return closeDialog();
+  d.classList.add("is-closing");
+  await new Promise((resolve) => setTimeout(resolve, MOTION.exit));
+  d.classList.remove("is-closing");
+  closeDialog();
+}
+dialog().addEventListener("cancel", (event) => {
+  if (!dialog().classList.contains("trash-dialog")) return;
+  event.preventDefault();
+  leaveDialog();
+});
 function confirmAction(title, text, label, run) {
   openDialog(`<div class="ae-dialog-head"><h2>${esc(title)}</h2></div><div class="ae-dialog-body"><p style="margin:0;color:var(--text-2)">${esc(text)}</p></div>
     <div class="ae-dialog-foot"><button class="ae-btn" data-act="dialog-cancel">${esc(t("Cancel"))}</button><button class="ae-btn ae-btn--danger" id="confirm">${esc(label)}</button></div>`);
@@ -1434,12 +1807,15 @@ function go(view, cursor = state.cursor) {
     return commitRoute({ view, date: cursor });
   }
   state.results = null;
+  state.notice = null;
+  state.screen = "calendar";
   if ($("#search")) $("#search").value = state.query = "";
   state.view = view;
   state.cursor = cursor;
   loadOccurrences();
 }
 function step(direction) {
+  if (state.screen === "trash") return;
   // A step still on its way to Nexus counts, so repeated presses do not collapse into one.
   const c = chronosNavigation.enabled ? queuedRoute?.date || state.cursor : state.cursor;
   let cursor = c;
@@ -1470,15 +1846,28 @@ function calendarMenu(anchor, c) {
     icon: "trash",
     danger: true,
     run: () =>
-      confirmAction(
-        c.kind === "subscription" ? t("Unsubscribe from “{name}”?", { name: c.name }) : t("Delete “{name}”?", { name: c.name }),
-        plural(c.event_count, "Its {count} event is removed from Chronos. This cannot be undone.", "Its {count} events are removed from Chronos. This cannot be undone."),
-        c.kind === "subscription" ? t("Unsubscribe") : t("Delete"),
-        async () => {
-          await attempt(() => api(`/calendars/${c.id}?confirmed=true`, "DELETE"), t("Removed “{name}”", { name: c.name }));
-          await refresh();
-        },
-      ),
+      c.kind === "native"
+        ? trashConfirm({
+            title: t("Delete “{name}”?", { name: c.name }),
+            text: c.event_count ? plural(c.event_count, "Its {count} event moves to Trash, and the calendar goes with it. You can restore them from Trash.", "Its {count} events move to Trash, and the calendar goes with them. You can restore them from Trash.") : t("This calendar has no events and will be removed."),
+            label: t("Move to Trash"),
+            run: async () => {
+              const result = await api(`/calendars/${c.id}?confirmed=true`, "DELETE");
+              await leaveDialog();
+              const batch = result.trash?.batch;
+              toast(t("Removed “{name}”", { name: c.name }), "", batch ? { label: t("Undo"), run: () => restoreBatch(batch) } : null);
+              await refresh();
+            },
+          })
+        : confirmAction(
+            c.kind === "subscription" ? t("Unsubscribe from “{name}”?", { name: c.name }) : t("Delete “{name}”?", { name: c.name }),
+            plural(c.event_count, "Its {count} event is removed from Chronos. This cannot be undone.", "Its {count} events are removed from Chronos. This cannot be undone."),
+            c.kind === "subscription" ? t("Unsubscribe") : t("Delete"),
+            async () => {
+              await attempt(() => api(`/calendars/${c.id}?confirmed=true`, "DELETE"), t("Removed “{name}”", { name: c.name }));
+              await refresh();
+            },
+          ),
   });
   openMenu(anchor, items);
 }
@@ -1486,20 +1875,32 @@ function eventMenu(anchor, id, occurrence) {
   const o = findOccurrence(state.selected?.key);
   const items = [{ label: t("Duplicate"), icon: "copy", run: async () => { await attempt(() => api(`/events/${id}/copy`, "POST", { calendar_id: o?.calendar_id || nativeCalendars()[0].id }), t("Event duplicated")); closeLayer({ mode: "replace" }); await refresh(); } }];
   items.push("-");
-  if (o?.recurring && occurrence)
-    items.push({ label: t("Delete this occurrence"), icon: "trash", danger: true, run: async () => { await attempt(() => api(`/events/${id}?occurrence=${encodeURIComponent(occurrence)}`, "DELETE"), t("Occurrence removed")); closeLayer({ mode: "replace" }); await refresh(); } });
-  items.push({
-    label: o?.recurring ? t("Delete all occurrences") : t("Delete event"),
-    icon: "trash",
-    danger: true,
-    run: () =>
-      confirmAction(t("Delete “{name}”?", { name: o?.title || "" }), o?.recurring ? t("Every occurrence of this repeating event is deleted.") : t("This cannot be undone."), t("Delete"), async () => {
-        await attempt(() => api(`/events/${id}`, "DELETE"), t("Event deleted"));
-        closeLayer({ mode: "replace" });
-        await refresh();
-      }),
-  });
+  const recurring = !!(o?.recurring || o?.rrule);
+  if (recurring && occurrence) items.push({ label: t("Delete this occurrence"), icon: "trash", danger: true, run: () => moveToTrashDialog(id, occurrence, o) });
+  items.push({ label: recurring ? t("Delete all occurrences") : t("Delete event"), icon: "trash", danger: true, run: () => moveToTrashDialog(id, "", o) });
   openMenu(anchor, items);
+}
+/** Deleting is one explicit choice: one occurrence, the whole series, or a single event. The
+ * backend also refuses a repeating event without one, so losing the choice cannot widen it. */
+function moveToTrashDialog(id, occurrence, o) {
+  const name = o?.title || "";
+  const recurring = !!(o?.recurring || o?.rrule);
+  const copy = occurrence
+    ? { title: t("Delete only this occurrence?"), text: t("“{name}” on {when} moves to Trash. The other occurrences stay on your calendar.", { name, when: whenText(o) }), label: t("Delete this occurrence"), done: t("Occurrence moved to Trash") }
+    : recurring
+      ? { title: t("Delete the whole series?"), text: t("Every occurrence of “{name}” moves to Trash. Restoring it brings the whole series back.", { name }), label: t("Delete all occurrences"), done: t("Series moved to Trash") }
+      : { title: t("Move “{name}” to Trash?", { name }), text: t("You can restore it from Trash at any time."), label: t("Move to Trash"), done: t("Moved to Trash") };
+  const query = occurrence ? `?occurrence=${encodeURIComponent(occurrence)}` : recurring ? "?scope=series" : "";
+  trashConfirm({
+    ...copy,
+    run: async () => {
+      const result = await api(`/events/${id}${query}`, "DELETE");
+      await leaveDialog();
+      closeLayer({ mode: "replace" });
+      toast(copy.done, "", result.trash ? { label: t("Undo"), run: () => restoreEntry(result.trash) } : null);
+      await afterTrashChange();
+    },
+  });
 }
 function choosePlanCalendar(run) {
   const calendars = nativeCalendars();
@@ -1571,8 +1972,22 @@ document.addEventListener("click", async (event) => {
     renderSidebar();
     return renderView();
   }
+  if (act === "trash") {
+    $("#app").classList.remove("nav-open");
+    return openTrash();
+  }
+  if (act === "back-calendar") return go(state.view, state.cursor);
+  if (act === "trash-open") return openTrashEntry(id, target);
+  if (act === "trash-restore") return trashRestoreRow(id, target);
+  if (act === "trash-restore-separate") return trashRestoreRow(id, target, { as_separate: true });
+  if (act === "trash-restore-batch") return restoreBatch(target.dataset.batch);
+  if (act === "trash-purge") return trashPurge(id);
+  if (act === "trash-empty") return trashEmpty();
+  if (act === "trash-more") return loadTrash({ more: true });
+  if (act === "trash-retry") return loadTrash();
+  if (act === "notice-restore") return noticeRestore(id);
   if (act === "close") return closeLayer();
-  if (act === "dialog-cancel") return closeDialog();
+  if (act === "dialog-cancel") return leaveDialog();
   if (act === "reload") return refresh();
   if (act === "edit") {
     const existing = await attempt(() => api(`/events/${id}`));
@@ -1705,6 +2120,11 @@ document.addEventListener("keydown", (event) => {
       state.results = null;
       return renderView();
     }
+    if (state.screen === "trash" && state.query) {
+      $("#search").value = "";
+      state.query = "";
+      return loadTrash({ quiet: true });
+    }
     return;
   }
   if (event.target.closest("input,textarea,select,[contenteditable]") || dialog().open || event.metaKey || event.ctrlKey || event.altKey) return;
@@ -1730,7 +2150,7 @@ async function start() {
   document.documentElement.lang = activeLocale;
   try {
     const data = await api("/state");
-    Object.assign(state, { settings: data.settings, calendars: data.calendars, categories: data.categories, sources: data.sources, version: data.version });
+    Object.assign(state, { settings: data.settings, calendars: data.calendars, categories: data.categories, sources: data.sources, version: data.version, trashCount: data.trash_count });
     if (!state.settings.time_zone_set) {
       const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
       if (zone) state.settings = await api("/settings", "PUT", { time_zone: zone }).catch(() => state.settings);
@@ -1754,7 +2174,7 @@ async function start() {
       if (await chronosNavigation.start(state.context)) {
         schedulePoll();
         // The first screen gets its exact address (view and date) without a new history entry.
-        const initial = shownParsed && !shownParsed.notFound && !shownParsed.date && !shownParsed.event && !shownParsed.projected ? ChronosRoutes.serialize(calendarRoute()) : shownRoute;
+        const initial = shownParsed && !shownParsed.notFound && !shownParsed.date && !shownParsed.event && !shownParsed.projected && !shownParsed.trash ? ChronosRoutes.serialize(calendarRoute()) : shownRoute;
         if (initial) {
           if (initial !== shownRoute) shownRoute = initial;
           await queueNavigation(initial, "replace").catch(() => {});
