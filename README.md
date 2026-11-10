@@ -30,6 +30,10 @@ Calendars and events for Aureate Empyrean. Canonical architecture: `../architect
 
 Read-only by design: no two-way synchronization, no CalDAV, no reminders yet.
 
+## Trash (0.6.0, in development, not deployed)
+
+Deleting one of your own events, one occurrence or a whole series moves it to Trash, with Undo. Trash lists what was deleted and when, with search, restore, and a separately confirmed permanent delete. Nothing leaves Trash automatically. Deleted events disappear from calendars, search, other modules' links and link search, and come back with the same identifiers and relationships. Imported and subscribed events stay read-only and never enter Trash. Details, recurrence rules, integration behaviour, migration and rollback: [`docs/TRASH.md`](docs/TRASH.md).
+
 ## Navigation (0.5.0 on aetest)
 
 Calendar views, dates, native events, single occurrences and projected dates are browser history entries through the
@@ -128,6 +132,8 @@ python -m venv .venv && .venv/bin/pip install -r requirements-dev.lock
 .venv/bin/ruff check backend tests scripts && .venv/bin/ruff format --check backend tests scripts
 node --check frontend/app.js
 ```
+
+Browser journeys for Trash run in a real Nexus shell against a disposable stack: `tests/e2e/trash_e2e.cjs` (usage in its header).
 
 Tests cover DST-correct recurrence, all-day dates, validation, the import matrix (overrides,
 cancelled occurrences, EXDATE, floating and custom zones, missing UIDs, broken components,
