@@ -59,6 +59,27 @@ CREATE TABLE cursors(name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE link_grants(event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
  requester TEXT NOT NULL, granted_at TEXT NOT NULL, PRIMARY KEY(event_id, requester));
 """,
+    # 0.6.0: Trash. Additive only: no existing row is rewritten, and every event stays active.
+    # An event in Trash keeps its row (trashed_at set) and an occurrence in Trash stays in the
+    # series' exdates, so `trash` only records what can be recovered. trash_audit holds ids and
+    # times, never content, and outlives permanent deletion.
+    """
+ALTER TABLE calendars ADD COLUMN trashed_at TEXT;
+ALTER TABLE events ADD COLUMN trashed_at TEXT;
+CREATE INDEX events_trashed ON events(trashed_at) WHERE trashed_at IS NOT NULL;
+CREATE TABLE trash(id TEXT PRIMARY KEY,
+ kind TEXT NOT NULL CHECK(kind IN ('event','series','occurrence')),
+ event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+ occurrence TEXT NOT NULL DEFAULT '', deleted_at TEXT NOT NULL, batch TEXT NOT NULL,
+ cause TEXT NOT NULL DEFAULT 'user' CHECK(cause IN ('user','calendar')),
+ snapshot TEXT NOT NULL, search TEXT NOT NULL DEFAULT '',
+ UNIQUE(event_id, occurrence));
+CREATE INDEX trash_batch ON trash(batch);
+CREATE TABLE trash_audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL,
+ action TEXT NOT NULL CHECK(action IN ('trash','restore','purge')), kind TEXT NOT NULL,
+ entry_id TEXT NOT NULL, event_id TEXT NOT NULL, occurrence TEXT NOT NULL DEFAULT '',
+ batch TEXT NOT NULL DEFAULT '');
+""",
 ]
 
 

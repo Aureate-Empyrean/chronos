@@ -115,7 +115,7 @@ def test_native_timed_event_keeps_zone_and_recurs_across_dst(env):
         "2026-11-09T08:30:00Z",
     ]
     skipped = client.delete(f"/api/events/{event['id']}?occurrence=2026-10-26T08:30:00Z")
-    assert skipped.json() == {"deleted": "occurrence"}
+    assert skipped.json()["deleted"] == "occurrence"
     found = occurrences(client, "2026-10-01T00:00:00Z", "2026-11-30T00:00:00Z")
     assert len(found) == 3 and "2026-10-26T08:30:00Z" not in [o["start"] for o in found]
     # Editing the title keeps the skipped occurrence.
@@ -591,11 +591,13 @@ def test_plan_links_event_resolves_and_enumerates(env):
             "readers": ["lyra"],
         }
     ]
-    client.delete(f"/api/events/{event['id']}")
-    assert resolve("lyra").status_code == 410
+    entry = client.delete(f"/api/events/{event['id']}").json()["trash"]
+    assert resolve("lyra").status_code == 404  # in Trash: unavailable, and it may come back
     app.state.worker.flush(force=True)
     assert ("DELETE", "/references/remote-1", None) in nexus.calls
     assert client.get("/empyrean/v1/references/outgoing", headers=RES).json()["references"] == []
+    client.delete(f"/api/trash/{entry}?confirmed=true")
+    assert resolve("lyra").status_code == 410  # deleted for good
 
 
 def test_backup_roundtrip_and_suspends_sync(env):

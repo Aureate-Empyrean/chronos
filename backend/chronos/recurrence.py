@@ -152,5 +152,25 @@ def expand(row, window_start: datetime, window_end: datetime, skip=frozenset()):
         yield key, start_utc, end_utc
 
 
+def occurrence_at(row, key: str):
+    """(start, end) text of the occurrence with exactly this key, or None if the series has none.
+
+    Exclusions are ignored: the question is whether the rule produces the key at all."""
+    plain = {**dict(row), "exdates": "[]"}
+    try:
+        if row["all_day"]:
+            low = datetime.combine(date.fromisoformat(key), time(), UTC)
+            high = low + timedelta(days=1)
+        else:
+            low = parse_instant(key)
+            high = low + timedelta(seconds=1)
+        for found, start, end in expand(plain, low, high):
+            if found == key:
+                return (start, end) if row["all_day"] else (instant(start), instant(end))
+    except (ValueError, OverflowError, KeyError, TypeError):
+        return None
+    return None
+
+
 def describe_parts(text: str | None) -> dict | None:
     return rule_parts(text) if text else None

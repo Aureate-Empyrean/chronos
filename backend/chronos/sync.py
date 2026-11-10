@@ -13,7 +13,7 @@ from datetime import timedelta
 import httpx
 
 from chronos import ical, net
-from chronos.store import apply_records, normalize_item
+from chronos.store import apply_records, normalize_item, queue
 from chronos.util import iso_now
 
 PROVIDERS = {"lyra": "#C98BE0", "mnemosyne": "#8B7CF6", "meridian": "#E3AE8E"}
@@ -297,10 +297,19 @@ class Worker:
                 continue
             with self.db.connect() as conn:
                 if entry["link_id"] and result.get("reference"):
-                    conn.execute(
-                        "UPDATE links SET remote_id=? WHERE id=?",
-                        (result["reference"]["id"], entry["link_id"]),
-                    )
+                    remote = result["reference"]["id"]
+                    owner = conn.execute(
+                        "SELECT e.trashed_at FROM links l JOIN events e ON e.id=l.event_id "
+                        "WHERE l.id=?",
+                        (entry["link_id"],),
+                    ).fetchone()
+                    if owner and owner["trashed_at"]:
+                        # Trashed while this was in flight: an event in Trash publishes nothing.
+                        queue(conn, "DELETE", f"/references/{remote}")
+                    else:
+                        conn.execute(
+                            "UPDATE links SET remote_id=? WHERE id=?", (remote, entry["link_id"])
+                        )
                 conn.execute("DELETE FROM outbox WHERE id=?", (entry["id"],))
 
     def _retry(self, entry):

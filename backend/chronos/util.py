@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import unicodedata
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
@@ -45,6 +46,12 @@ def day_bounds(start: str, end: str) -> tuple[str, str]:
     a = datetime.combine(date.fromisoformat(start), datetime.min.time(), UTC) - timedelta(hours=15)
     b = datetime.combine(date.fromisoformat(end), datetime.min.time(), UTC) + timedelta(hours=15)
     return instant(a), instant(b)
+
+
+def fold(value: str | None) -> str:
+    """Case- and accent-insensitive form of a text, for searching."""
+    decomposed = unicodedata.normalize("NFKD", value or "")
+    return "".join(c for c in decomposed if not unicodedata.combining(c)).casefold()
 
 
 def reference(kind: str, rid: str) -> str:

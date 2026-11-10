@@ -19,12 +19,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
-from chronos import VERSION, ical, net
+from chronos import VERSION, ical, net, trash
 from chronos.db import MIGRATIONS, Database
 from chronos.recurrence import validate_native_rule
 from chronos.store import (
     apply_records,
     delete_event,
+    edge_body,
     index_bounds,
     occurrences,
     projected_json,
@@ -138,6 +139,15 @@ class CopyBody(Strict):
     calendar_id: str
 
 
+class RestoreBody(Strict):
+    as_separate: bool = False
+
+
+class EmptyTrashBody(Strict):
+    confirmed: bool
+    expected: int = Field(ge=0)
+
+
 def styles():
     """Shared tokens, the shared foundation, the bundled Roboto face (inline: the sandbox
     has no network), then Chronos's own styles."""
@@ -177,7 +187,9 @@ def create_app(
 
     with db.connect() as conn:
         worker.ensure_sources(conn)
-        if not conn.execute("SELECT 1 FROM calendars WHERE kind='native'").fetchone():
+        if not conn.execute(
+            "SELECT 1 FROM calendars WHERE kind='native' AND trashed_at IS NULL"
+        ).fetchone():
             stamp = iso_now()
             conn.execute(
                 "INSERT INTO calendars(id,kind,name,color,created_at,updated_at) "
@@ -218,27 +230,33 @@ def create_app(
                 return JSONResponse({"detail": "Nexus gateway required"}, status_code=403)
         return await call_next(request)
 
+    @app.exception_handler(trash.TrashError)
+    async def trash_refused(request: Request, exc: trash.TrashError):
+        return JSONResponse({"detail": exc.message}, status_code=exc.status)
+
     # ── Helpers ──────────────────────────────────────────────────────
 
     def calendar(conn, cid, kinds=None):
         row = conn.execute("SELECT * FROM calendars WHERE id=?", (cid,)).fetchone()
-        if not row:
+        if not row or row["trashed_at"]:
             raise HTTPException(404, "Calendar not found")
         if kinds and row["kind"] not in kinds:
             raise HTTPException(409, "This calendar cannot be changed here")
         return row
 
-    def event_row(conn, eid):
+    def event_row(conn, eid, include_trash=False):
         row = conn.execute("SELECT * FROM events WHERE id=?", (eid,)).fetchone()
         if not row:
             raise HTTPException(404, "Event not found")
+        if row["trashed_at"] and not include_trash:
+            raise HTTPException(410, "This event is in Trash. Restore it to use it.")
         return row
 
     def calendar_json(conn, row):
         value = dict(row)
         value["visible"] = bool(value["visible"])
         value["event_count"] = conn.execute(
-            "SELECT count(*) FROM events WHERE calendar_id=?", (row["id"],)
+            "SELECT count(*) FROM events WHERE calendar_id=? AND trashed_at IS NULL", (row["id"],)
         ).fetchone()[0]
         if row["kind"] == "subscription":
             sub = conn.execute(
@@ -405,7 +423,8 @@ def create_app(
                 "calendars": [
                     calendar_json(conn, r)
                     for r in conn.execute(
-                        "SELECT * FROM calendars ORDER BY kind!='native',position,created_at"
+                        "SELECT * FROM calendars WHERE trashed_at IS NULL "
+                        "ORDER BY kind!='native',position,created_at"
                     )
                 ],
                 "categories": [
@@ -413,6 +432,7 @@ def create_app(
                 ],
                 "sources": sources_json(conn),
                 "pending_sync": conn.execute("SELECT count(*) FROM outbox").fetchone()[0],
+                "trash_count": conn.execute("SELECT count(*) FROM trash").fetchone()[0],
             }
 
     @app.get("/api/timezones")
@@ -463,13 +483,28 @@ def create_app(
         if not confirmed:
             raise HTTPException(422, "Deleting a calendar requires confirmation")
         with db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = calendar(conn, cid)
             if (
                 row["kind"] == "native"
-                and conn.execute("SELECT count(*) FROM calendars WHERE kind='native'").fetchone()[0]
+                and conn.execute(
+                    "SELECT count(*) FROM calendars WHERE kind='native' AND trashed_at IS NULL"
+                ).fetchone()[0]
                 == 1
             ):
                 raise HTTPException(409, "Keep at least one of your own calendars")
+            events = conn.execute("SELECT * FROM events WHERE calendar_id=?", (cid,)).fetchall()
+            if row["kind"] == "native" and events:
+                # The calendar stays as their container until nothing recoverable is left in it.
+                active = [e for e in events if not e["trashed_at"]]
+                batch = uuid7() if active else None
+                for event in active:
+                    trash.move_event(conn, event, batch, "calendar")
+                conn.execute(
+                    "UPDATE calendars SET trashed_at=?,updated_at=? WHERE id=?",
+                    (iso_now(), iso_now(), cid),
+                )
+                return {"deleted": True, "trash": {"batch": batch, "count": len(active)}}
             for event in conn.execute(
                 "SELECT id FROM events WHERE calendar_id=?", (cid,)
             ).fetchall():
@@ -534,7 +569,8 @@ def create_app(
         with db.connect() as conn:
             rows = conn.execute(
                 "SELECT e.*,c.name AS calendar_name,c.color AS calendar_color FROM events e "
-                "JOIN calendars c ON c.id=e.calendar_id WHERE e.recurrence_id='' AND "
+                "JOIN calendars c ON c.id=e.calendar_id "
+                "WHERE e.recurrence_id='' AND e.trashed_at IS NULL AND "
                 "(e.title LIKE ? ESCAPE '\\' OR e.location LIKE ? ESCAPE '\\' OR e.description LIKE ? ESCAPE '\\') "
                 "ORDER BY e.start DESC LIMIT 60",
                 (pattern, pattern, pattern),
@@ -584,18 +620,26 @@ def create_app(
     @app.put("/api/events/{eid}")
     def update_event(eid: str, body: EventBody):
         with db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             old = event_row(conn, eid)
             if old["origin"] != "native":
                 raise HTTPException(
                     409, "Events from imported or subscribed calendars are read-only"
                 )
             values = event_values(conn, body)
-            if (
-                values["rrule"]
-                and values["rrule"] == old["rrule"]
-                and values["start"] == old["start"]
-            ):
-                values["exdates"] = old["exdates"]  # skipped occurrences survive unrelated edits
+            if values["rrule"]:
+                # Skipped occurrences survive edits that keep the start. A reschedule moves every
+                # occurrence, but whatever is in Trash stays deleted until it is restored.
+                skipped = (
+                    set(json.loads(old["exdates"])) if values["start"] == old["start"] else set()
+                )
+                skipped.update(
+                    r["occurrence"]
+                    for r in conn.execute(
+                        "SELECT occurrence FROM trash WHERE event_id=? AND occurrence!=''", (eid,)
+                    )
+                )
+                values["exdates"] = json.dumps(sorted(skipped))
             assignments = ",".join(f"{column}=?" for column in values)
             conn.execute(
                 f"UPDATE events SET {assignments},updated_at=? WHERE id=?",
@@ -604,8 +648,11 @@ def create_app(
             return event_json(conn, event_row(conn, eid))
 
     @app.delete("/api/events/{eid}")
-    def remove_event(eid: str, occurrence: str = ""):
+    def remove_event(eid: str, occurrence: str = "", scope: str = ""):
+        """Move to Trash. A repeating event needs an explicit target: one occurrence, or the
+        whole series with scope=series, so that losing the occurrence can never widen a delete."""
         with db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = event_row(conn, eid)
             if row["origin"] != "native":
                 raise HTTPException(
@@ -614,14 +661,62 @@ def create_app(
             if occurrence:
                 if not row["rrule"]:
                     raise HTTPException(422, "Only repeating events have occurrences")
-                skipped = sorted(set(json.loads(row["exdates"])) | {occurrence[:20]})
-                conn.execute(
-                    "UPDATE events SET exdates=?,updated_at=? WHERE id=?",
-                    (json.dumps(skipped), iso_now(), eid),
-                )
-                return {"deleted": "occurrence"}
-            delete_event(conn, eid)
-        return {"deleted": "event"}
+                return {
+                    "deleted": "occurrence",
+                    "trash": trash.move_occurrence(conn, row, occurrence),
+                }
+            if row["rrule"] and scope != "series":
+                raise HTTPException(422, "Choose one occurrence or the whole series")
+            return {"deleted": "event", "trash": trash.move_event(conn, row)}
+
+    # ── Trash ────────────────────────────────────────────────────────
+
+    @app.get("/api/trash")
+    def trash_list(q: str = "", cursor: str = "", limit: int = 50):
+        with db.connect() as conn:
+            return trash.listing(conn, q[:100], cursor, max(1, min(limit, 200)))
+
+    @app.get("/api/trash/lookup")
+    def trash_lookup(event_id: str, occurrence: str = ""):
+        with db.connect() as conn:
+            entry = trash.lookup(conn, event_id, occurrence)
+            if not entry:
+                raise HTTPException(404, trash.NOT_IN_TRASH)
+            return trash.entry_json(conn, entry)
+
+    @app.post("/api/trash/empty")
+    def trash_empty(body: EmptyTrashBody):
+        if not body.confirmed:
+            raise HTTPException(422, "Emptying Trash requires confirmation")
+        with db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return trash.empty(conn, body.expected)
+
+    @app.post("/api/trash/batches/{batch}/restore")
+    def trash_restore_batch(batch: str):
+        with db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return trash.restore_batch(conn, batch)
+
+    @app.get("/api/trash/{entry_id}")
+    def trash_detail(entry_id: str):
+        with db.connect() as conn:
+            return trash.detail(conn, trash.get(conn, entry_id))
+
+    @app.post("/api/trash/{entry_id}/restore")
+    def trash_restore(entry_id: str, body: RestoreBody | None = None):
+        with db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            entry = trash.get(conn, entry_id)
+            return trash.restore(conn, entry, separate=bool(body and body.as_separate))
+
+    @app.delete("/api/trash/{entry_id}")
+    def trash_purge(entry_id: str, confirmed: bool = False):
+        if not confirmed:
+            raise HTTPException(422, "Permanent deletion requires confirmation")
+        with db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return trash.purge(conn, trash.get(conn, entry_id))
 
     @app.post("/api/events/{eid}/copy", status_code=201)
     def copy_event(eid: str, body: CopyBody):
@@ -657,6 +752,7 @@ def create_app(
     @app.delete("/api/events/{eid}/links/{lid}")
     def unlink(eid: str, lid: str):
         with db.connect() as conn:
+            event_row(conn, eid)
             link = conn.execute(
                 "SELECT * FROM links WHERE id=? AND event_id=?", (lid, eid)
             ).fetchone()
@@ -703,9 +799,10 @@ def create_app(
     @app.get("/api/events/{eid}/linked-from")
     def linked_from(eid: str):
         """Backlinks standard (concepts/backlinks.md): items in other modules that link to this
-        event and share it with Chronos, labelled by their owners. Never raises."""
+        event and share it with Chronos, labelled by their owners. Never raises. Also answered
+        for an event in Trash, so permanent deletion can warn about what points at it."""
         with db.connect() as conn:
-            event_row(conn, eid)
+            event_row(conn, eid, include_trash=True)
         try:
             page = nexus.request("GET", f"/references?resource={reference('event', eid)}&direction=incoming&limit=100")
         except httpx.HTTPStatusError as exc:
@@ -862,7 +959,8 @@ def create_app(
                 existing = {
                     (r["source_uid"], r["recurrence_id"])
                     for r in conn.execute(
-                        "SELECT source_uid,recurrence_id FROM events WHERE calendar_id=?",
+                        "SELECT source_uid,recurrence_id FROM events "
+                        "WHERE calendar_id=? AND trashed_at IS NULL",
                         (body.calendar_id,),
                     )
                 }
@@ -870,7 +968,7 @@ def create_app(
             elsewhere = {}
             for r in conn.execute(
                 "SELECT DISTINCT e.source_uid,c.name FROM events e JOIN calendars c ON c.id=e.calendar_id "
-                "WHERE e.source_uid IS NOT NULL AND c.id IS NOT ?",
+                "WHERE e.source_uid IS NOT NULL AND e.trashed_at IS NULL AND c.id IS NOT ?",
                 (body.calendar_id,),
             ):
                 if r["source_uid"] in uids:
@@ -1140,6 +1238,9 @@ def create_app(
             if not row:
                 gone = conn.execute("SELECT 1 FROM tombstones WHERE id=?", (match[3],)).fetchone()
                 raise HTTPException(410 if gone else 404, "Unavailable")
+            if row["trashed_at"]:
+                # Unavailable, not "deleted": it may still come back (same answer as Atlas).
+                raise HTTPException(404, "Unavailable")
             # Events disclose metadata only to modules they were explicitly shared with.
             shared = any(
                 body.get("requester") in json.loads(link["readers"])
@@ -1168,7 +1269,7 @@ def create_app(
         tokens = [t for t in folded(str(query.get("q") or "")[:100]).split() if t][:8]
         requester = str(body.get("requester") or "")
         with db.connect() as conn:
-            rows = conn.execute("SELECT id, title, start FROM events WHERE status<>'cancelled' ORDER BY start DESC LIMIT 2000").fetchall()
+            rows = conn.execute("SELECT id, title, start FROM events WHERE status<>'cancelled' AND trashed_at IS NULL ORDER BY start DESC LIMIT 2000").fetchall()
             found = [r for r in rows if all(t in folded(r["title"]) for t in tokens)][:limit]
             for r in found:
                 conn.execute("INSERT OR IGNORE INTO link_grants(event_id, requester, granted_at) VALUES(?,?,?)", (r["id"], requester, iso_now()))
@@ -1184,7 +1285,9 @@ def create_app(
         limit = max(1, min(limit, 200))
         with db.connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM links WHERE id>? ORDER BY id LIMIT ?", (cursor, limit + 1)
+                "SELECT l.* FROM links l JOIN events e ON e.id=l.event_id "
+                "WHERE e.trashed_at IS NULL AND l.id>? ORDER BY l.id LIMIT ?",
+                (cursor, limit + 1),
             ).fetchall()
         page = rows[:limit]
         return {
@@ -1299,20 +1402,11 @@ def create_app(
         with db.connect() as conn:
             conn.execute("DELETE FROM outbox")
             conn.execute("UPDATE subscriptions SET running=0")
-            for link in conn.execute("SELECT * FROM links").fetchall():
-                queue(
-                    conn,
-                    "POST",
-                    "/references",
-                    {
-                        "source": reference("event", link["event_id"]),
-                        "target": link["target"],
-                        "relation": link["relation"],
-                        "metadata": {},
-                        "readers": json.loads(link["readers"]),
-                    },
-                    link["id"],
-                )
+            for link in conn.execute(
+                "SELECT l.* FROM links l JOIN events e ON e.id=l.event_id "
+                "WHERE e.trashed_at IS NULL"
+            ).fetchall():
+                queue(conn, "POST", "/references", edge_body(link), link["id"])
 
     @app.post("/empyrean/v1/backup/restore")
     async def backup_restore(request: Request):

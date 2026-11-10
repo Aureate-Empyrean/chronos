@@ -5,7 +5,7 @@ from collections import defaultdict
 from datetime import date, timedelta
 
 from chronos.recurrence import expand, series_end
-from chronos.util import day_bounds, instant, iso_now, parse_instant, uuid7
+from chronos.util import day_bounds, instant, iso_now, parse_instant, reference, uuid7
 
 EVENT_COLUMNS = (
     "title",
@@ -43,8 +43,35 @@ def queue(conn, method, path, body=None, link_id=None):
     )
 
 
+def edge_body(link):
+    """The Nexus reference a stored link publishes."""
+    return {
+        "source": reference("event", link["event_id"]),
+        "target": link["target"],
+        "relation": link["relation"],
+        "metadata": {},
+        "readers": json.loads(link["readers"]),
+    }
+
+
+def unpublish_links(conn, event_id):
+    """Take an event's edges out of the Nexus index. The links stay, for a later restore."""
+    for link in conn.execute("SELECT id,remote_id FROM links WHERE event_id=?", (event_id,)):
+        conn.execute("DELETE FROM outbox WHERE link_id=?", (link["id"],))
+        if link["remote_id"]:
+            queue(conn, "DELETE", f"/references/{link['remote_id']}")
+    conn.execute("UPDATE links SET remote_id=NULL WHERE event_id=?", (event_id,))
+
+
+def publish_links(conn, event_id):
+    """Queue an event's edges for Nexus. Nexus upserts them, so repeating this is harmless."""
+    for link in conn.execute("SELECT * FROM links WHERE event_id=?", (event_id,)).fetchall():
+        conn.execute("DELETE FROM outbox WHERE link_id=?", (link["id"],))
+        queue(conn, "POST", "/references", edge_body(link), link["id"])
+
+
 def delete_event(conn, event_id):
-    """Delete an event, unpublish its Nexus edges and keep a tombstone for resolution."""
+    """Delete an event for good, unpublish its Nexus edges and keep a tombstone for resolution."""
     for link in conn.execute("SELECT remote_id FROM links WHERE event_id=?", (event_id,)):
         if link["remote_id"]:
             queue(conn, "DELETE", f"/references/{link['remote_id']}")
@@ -60,11 +87,12 @@ def apply_records(conn, calendar_id, origin, records, delete_missing):
 
     Unchanged content is skipped, so repeated imports and refreshes never duplicate;
     existing Chronos UUIDs are kept on update. Missing events are deleted only when the
-    caller states the source is complete (subscriptions), never for one-time imports."""
+    caller states the source is complete (subscriptions), never for one-time imports.
+    A row in Trash is left exactly as it is: a source can never bring it back."""
     existing = {
         (row["source_uid"], row["recurrence_id"]): row
         for row in conn.execute(
-            "SELECT id,source_uid,recurrence_id,content_hash,sequence FROM events "
+            "SELECT id,source_uid,recurrence_id,content_hash,sequence,trashed_at FROM events "
             "WHERE calendar_id=?",
             (calendar_id,),
         )
@@ -79,7 +107,7 @@ def apply_records(conn, calendar_id, origin, records, delete_missing):
         values["range_start"], values["range_end"] = index_bounds({**values, **record})
         old = existing.pop(key, None)
         if old:
-            if old["content_hash"] == record["content_hash"] or (
+            if old["trashed_at"] or old["content_hash"] == record["content_hash"] or (
                 not delete_missing and old["sequence"] > record["sequence"]
             ):
                 counts["unchanged"] += 1
@@ -107,6 +135,8 @@ def apply_records(conn, calendar_id, origin, records, delete_missing):
             counts["created"] += 1
     if delete_missing:
         for old in existing.values():
+            if old["trashed_at"]:
+                continue
             delete_event(conn, old["id"])
             counts["removed"] += 1
     return counts
@@ -124,13 +154,15 @@ def occurrences(conn, window_start, window_end, settings, query=None):
     categories = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM categories")}
     overrides = defaultdict(set)
     for row in conn.execute(
-        "SELECT calendar_id,source_uid,recurrence_id FROM events WHERE recurrence_id!=''"
+        "SELECT calendar_id,source_uid,recurrence_id FROM events "
+        "WHERE recurrence_id!='' AND trashed_at IS NULL"
     ):
         overrides[(row["calendar_id"], row["source_uid"])].add(row["recurrence_id"])
     rows = conn.execute(
         "SELECT e.*,c.color AS calendar_color,c.name AS calendar_name,c.kind AS calendar_kind "
         "FROM events e JOIN calendars c ON c.id=e.calendar_id "
-        "WHERE c.visible=1 AND e.range_start<? AND (e.range_end IS NULL OR e.range_end>?)",
+        "WHERE c.visible=1 AND e.trashed_at IS NULL "
+        "AND e.range_start<? AND (e.range_end IS NULL OR e.range_end>?)",
         (instant(window_end), instant(window_start)),
     ).fetchall()
     result = []
