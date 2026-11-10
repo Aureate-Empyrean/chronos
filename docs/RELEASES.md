@@ -35,3 +35,20 @@ The build is **not reproducible to the digest**. Two rebuilds gave two different
 ## Conventions
 
 Create the tag before deploying and build from a clean checkout of it. Record the commit and image digest in the deployment record. Do not move a published tag.
+
+## Rewritten commit identifiers
+
+This repository's history was rewritten on 2026-11-10. Earlier entries keep the identifiers recorded at the time. The tables give the current ones.
+
+| Old commit | New commit |
+| --- | --- |
+| `89cafddb54` | `4b16427653` |
+| `d1183919a9` | `7bc245c245` |
+| `7b2d16531e` | `475ef1414f` |
+| `0ebb2d1ea8` | `5d8a033f6d` |
+| `8eabe463cd` | `460b518c3f` |
+
+| Tag | Old object | New object |
+| --- | --- | --- |
+| `v0.4.0` | `d611ee9620` | `1291f7d446` |
+| `v0.5.0` | `08876d1671` | `b9fd33bd2d` |
