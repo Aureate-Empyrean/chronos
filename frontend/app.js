@@ -298,6 +298,8 @@ function toast(message, tone = "", action = null) {
   box.append(el);
   setTimeout(leave, action ? 10000 : tone === "danger" ? 9000 : 4500);
 }
+/** The backend's answer to a write based on a version that is no longer the stored one. */
+const isConflict = (error) => /changed elsewhere/i.test(error?.message || "");
 async function attempt(work, success) {
   try {
     const result = await work();
@@ -851,7 +853,7 @@ async function openDetails(key, trigger) {
     actions.push(`<button class="ae-btn" data-act="copy" data-id="${esc(event.id)}">${icon("copy")}<span>${esc(t("Copy to my calendar"))}</span></button>`);
   } else {
     actions.push(`<button class="ae-btn ae-btn--primary" data-act="edit" data-id="${esc(event.id)}">${icon("edit")}<span>${esc(t("Edit"))}</span></button>`);
-    actions.push(`<span class="grow"></span><button class="ae-btn ae-btn--quiet ae-btn--icon" data-act="event-menu" data-id="${esc(event.id)}" data-occurrence="${esc(o.occurrence || "")}" aria-label="${esc(t("More actions"))}" aria-haspopup="menu">${icon("more")}</button>`);
+    actions.push(`<span class="grow"></span><button class="ae-btn ae-btn--quiet ae-btn--icon" data-act="event-menu" data-id="${esc(event.id)}" data-occurrence="${esc(o.occurrence || "")}" data-revision="${esc(event.revision)}" aria-label="${esc(t("More actions"))}" aria-haspopup="menu">${icon("more")}</button>`);
   }
   $("#layer").innerHTML = `<div class="ae-scrim" data-act="close"></div>
     <aside class="ae-drawer ae-glass ${isProjection ? "is-projection" : ""}" style="--c:${esc(o.color)}" role="dialog" aria-modal="true" aria-labelledby="details-title">
@@ -1012,6 +1014,7 @@ async function loadTrash({ more = false, quiet = false } = {}) {
     box.items = more ? [...box.items, ...data.items] : data.items;
     box.matched = data.matched;
     box.total = data.total;
+    box.generation = data.generation;
     box.next = data.next_cursor;
     box.error = null;
     state.trashCount = data.total;
@@ -1213,6 +1216,7 @@ async function trashPurge(id) {
 }
 function trashEmpty() {
   const count = state.trash.total;
+  const generation = state.trash.generation;
   trashConfirm({
     title: t("Empty Trash?"),
     text: plural(count, "{count} deleted item is removed for good. This cannot be undone.", "All {count} deleted items are removed for good. This cannot be undone."),
@@ -1221,7 +1225,7 @@ function trashEmpty() {
     safeFocus: true,
     run: async () => {
       try {
-        await api("/trash/empty", "POST", { confirmed: true, expected: count });
+        await api("/trash/empty", "POST", { confirmed: true, expected_generation: generation });
       } catch (error) {
         await loadTrash({ quiet: true });
         throw error;
@@ -1378,6 +1382,41 @@ document.addEventListener("click", (event) => {
 
 /* Calendar and category dialogs */
 
+/** Run a save from a form. On a conflict the form stays open, with its contents, and says what
+ * is stored now; saving again is then a decision made with that knowledge. */
+async function saveGuarded(work, reload) {
+  try {
+    return await work();
+  } catch (error) {
+    if (!isConflict(error)) {
+      toast(error.message || t("Something went wrong."), "danger");
+      return undefined;
+    }
+    const note = await reload();
+    if (note === null) {
+      toast(t("This no longer exists."), "danger");
+      closeDialog();
+      await refresh();
+      return undefined;
+    }
+    showDialogConflict(note);
+    renderSidebar();
+    return undefined;
+  }
+}
+function showDialogConflict(text) {
+  const body = $(".ae-dialog-body", dialog());
+  let box = $("#dialog-conflict", body);
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "dialog-conflict";
+    box.className = "ae-banner ae-banner--warn dialog-conflict";
+    box.setAttribute("role", "alert");
+    body.prepend(box);
+  }
+  box.innerHTML = `${icon("alert")}<div>${esc(text)}</div>`;
+}
+
 function calendarDialog(existing) {
   openDialog(`<div class="ae-dialog-head"><h2>${esc(existing ? t("Calendar settings") : t("New calendar"))}</h2></div>
     <div class="ae-dialog-body form">
@@ -1388,7 +1427,18 @@ function calendarDialog(existing) {
   $("#save").onclick = async () => {
     const body = { name: $("#cal-name").value.trim(), color: pickedColor(dialog(), "cal") || PALETTE[0] };
     if (!body.name) return $("#cal-name").setAttribute("aria-invalid", "true");
-    const ok = await attempt(() => (existing ? api(`/calendars/${existing.id}`, "PUT", body) : api("/calendars", "POST", body)));
+    const ok = existing
+      ? await saveGuarded(
+          () => api(`/calendars/${existing.id}`, "PUT", { ...body, expected_revision: existing.revision }),
+          async () => {
+            await loadState();
+            const latest = calendarById(existing.id);
+            if (!latest) return null;
+            existing = latest;
+            return t("This calendar changed elsewhere. It is now named “{name}”. Your changes are still here; save again to replace it.", { name: latest.name });
+          },
+        )
+      : await attempt(() => api("/calendars", "POST", body));
     if (ok) {
       closeDialog();
       await refresh();
@@ -1405,14 +1455,26 @@ function categoryDialog(existing) {
   $("#save").onclick = async () => {
     const body = { name: $("#cat-name").value.trim(), color: pickedColor(dialog(), "cat") || PALETTE[7] };
     if (!body.name) return $("#cat-name").setAttribute("aria-invalid", "true");
-    if (await attempt(() => (existing ? api(`/categories/${existing.id}`, "PUT", body) : api("/categories", "POST", body)))) {
+    const saved = existing
+      ? await saveGuarded(
+          () => api(`/categories/${existing.id}`, "PUT", { ...body, expected_revision: existing.revision }),
+          async () => {
+            await loadState();
+            const latest = state.categories.find((c) => c.id === existing.id);
+            if (!latest) return null;
+            existing = latest;
+            return t("This category changed elsewhere. It is now named “{name}”. Your changes are still here; save again to replace it.", { name: latest.name });
+          },
+        )
+      : await attempt(() => api("/categories", "POST", body));
+    if (saved) {
       closeDialog();
       await refresh();
     }
   };
   if (existing)
     $("#delete-cat").onclick = async () => {
-      await attempt(() => api(`/categories/${existing.id}`, "DELETE"));
+      await attempt(() => api(`/categories/${existing.id}?expected_revision=${existing.revision}`, "DELETE"));
       state.categoryFilter.delete(existing.id);
       closeDialog();
       await refresh();
@@ -1430,7 +1492,32 @@ function zoneOptions(selected) {
   const zones = state.zones.length ? state.zones : [selected];
   return zones.map((z) => `<option value="${esc(z)}" ${z === selected ? "selected" : ""}>${esc(z.replace(/_/g, " "))}</option>`).join("");
 }
-async function eventEditor(existing, defaults = {}) {
+/** What differs between the stored event and the form, as rows of field, stored and yours. */
+function conflictRows(stored, mine, opened) {
+  const when = (e) => {
+    if (e.all_day) return e.start === addDays(e.end, -1) ? e.start : `${e.start} – ${addDays(e.end, -1)}`;
+    return `${String(e.startLocal).replace("T", " ")} – ${String(e.endLocal).replace("T", " ")} · ${e.time_zone}`;
+  };
+  const storedWhen = { ...stored, startLocal: stored.start_local, endLocal: stored.end_local };
+  const mineWhen = { ...mine, startLocal: mine.start, endLocal: mine.end };
+  const statusName = (s) => ({ confirmed: t("Confirmed"), tentative: t("Tentative"), cancelled: t("Cancelled") })[s] || s;
+  const categoryName = (id) => state.categories.find((c) => c.id === id)?.name || t("None");
+  const pairs = [
+    [t("Title"), stored.title, mine.title],
+    [t("When"), when(storedWhen), when(mineWhen)],
+    [t("Repeat"), ruleText(stored.rrule) || t("Does not repeat"), ruleText(mine.rrule) || t("Does not repeat")],
+    [t("Calendar"), stored.calendar.name, calendarById(mine.calendar_id)?.name || mine.calendar_id],
+    [t("Category"), categoryName(stored.category_id), categoryName(mine.category_id)],
+    [t("Location"), stored.location || "—", mine.location || "—"],
+    [t("Description"), stored.description || "—", mine.description || "—"],
+    [t("Status"), statusName(stored.status), statusName(mine.status)],
+  ];
+  const rows = pairs.filter(([, a, b]) => a !== b);
+  if (opened && stored.exdates.length !== opened.exdates.length)
+    rows.push([t("Deleted or skipped occurrences"), String(stored.exdates.length), t("{count} when you opened it", { count: opened.exdates.length })]);
+  return rows;
+}
+async function eventEditor(existing, defaults = {}, baseRevision) {
   if (!state.zones.length) state.zones = (await api("/timezones").catch(() => ({ zones: [] }))).zones;
   const calendars = nativeCalendars();
   const now = zoneParts(new Date());
@@ -1507,16 +1594,13 @@ async function eventEditor(existing, defaults = {}) {
     box.textContent = message;
     box.hidden = false;
   };
-  $("#save", root).onclick = async (event) => {
+  const collect = () => {
     const title = $("#ev-title", root).value.trim();
-    if (!title) {
-      $("#ev-title", root).setAttribute("aria-invalid", "true");
-      return fail(t("Add a title."));
-    }
+    if (!title) return { error: t("Add a title."), invalid: "#ev-title" };
     const isAllDay = $("#ev-allday", root).checked;
     const start = $("#ev-start", root).value;
     const end = $("#ev-end", root).value;
-    if (!start || !end) return fail(t("Choose a start and an end."));
+    if (!start || !end) return { error: t("Choose a start and an end.") };
     const startDayValue = start;
     const repeat = $("#ev-repeat", root).value;
     let rrule = null;
@@ -1554,23 +1638,82 @@ async function eventEditor(existing, defaults = {}) {
       category_id: $("#ev-category", root).value || null,
       color: pickedColor(root, "ev"),
     };
-    if (isAllDay ? body.end <= body.start : body.end < body.start) return fail(t("The end must be after the start."));
-    event.currentTarget.classList.add("is-busy");
+    if (isAllDay ? body.end <= body.start : body.end < body.start) return { error: t("The end must be after the start.") };
+    return { body };
+  };
+  /* A conflict never changes the form and never saves anything by itself. The owner reads what
+     is stored now, then keeps their version against that exact revision or takes the stored one. */
+  const reviewConflict = async (box) => {
+    const slot = $("#conflict-review", box);
+    let stored;
     try {
-      const saved = existing ? await api(`/events/${existing.id}`, "PUT", body) : await api("/events", "POST", body);
+      stored = await api(`/events/${existing.id}`);
+    } catch (error) {
+      slot.innerHTML = `<p class="conflict-note">${esc(error.message)}</p>`;
+      return;
+    }
+    const { body } = collect();
+    const rows = body ? conflictRows(stored, body, existing) : [];
+    slot.innerHTML = `${
+      rows.length
+        ? `<table class="conflict-table"><thead><tr><th></th><th>${esc(t("Stored now"))}</th><th>${esc(t("Your edit"))}</th></tr></thead><tbody>${rows.map(([field, a, b]) => `<tr><th scope="row">${esc(field)}</th><td>${esc(a)}</td><td>${esc(b)}</td></tr>`).join("")}</tbody></table>`
+        : `<p class="conflict-note">${esc(t("The stored version now has the same details as your form."))}</p>`
+    }<div class="conflict-actions"><button type="button" class="ae-btn ae-btn--sm ae-btn--primary" id="conflict-keep">${esc(t("Save my version"))}</button><button type="button" class="ae-btn ae-btn--sm" id="conflict-use">${esc(t("Discard my edits and use the stored version"))}</button></div>`;
+    $("#conflict-keep", slot).onclick = (event) => {
+      editorSession.revision = stored.revision;
+      scheduleCheckpoint();
+      save(event.currentTarget);
+    };
+    $("#conflict-use", slot).onclick = () => eventEditor(stored);
+    animate(slot, [{ opacity: 0, transform: "translateY(4px)" }, { opacity: 1, transform: "none" }], { duration: MOTION.page, easing: MOTION.ease });
+  };
+  const showConflict = () => {
+    $("#ev-error", root).hidden = true;
+    let box = $("#editor-conflict", root);
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "editor-conflict";
+      box.className = "ae-banner ae-banner--warn editor-conflict";
+      box.setAttribute("role", "alert");
+      $("#editor", root).prepend(box);
+      animate(box, [{ opacity: 0, transform: "translateY(-4px)" }, { opacity: 1, transform: "none" }], { duration: MOTION.page, easing: MOTION.ease });
+    }
+    box.innerHTML = `${icon("alert")}<div class="conflict-body"><strong>${esc(t("This event changed elsewhere"))}</strong><p>${esc(t("Nothing was saved, and your edits are still here. Review the stored version before you decide."))}</p><div class="conflict-actions"><button type="button" class="ae-btn ae-btn--sm" id="conflict-review-open">${esc(t("Review stored version"))}</button></div><div id="conflict-review"></div></div>`;
+    $("#conflict-review-open", box).onclick = (event) => {
+      event.currentTarget.closest(".conflict-actions").remove();
+      reviewConflict(box);
+    };
+    box.scrollIntoView({ block: "nearest" });
+    $("#conflict-review-open", box).focus();
+  };
+  let saving = false;
+  const save = async (button) => {
+    if (saving) return;
+    const { body, error: problem, invalid } = collect();
+    if (problem) {
+      if (invalid) $(invalid, root).setAttribute("aria-invalid", "true");
+      return fail(problem);
+    }
+    saving = true;
+    button.classList.add("is-busy");
+    try {
+      const saved = existing ? await api(`/events/${existing.id}`, "PUT", { ...body, expected_revision: editorSession.revision }) : await api("/events", "POST", body);
       closeDialog();
       closeLayer({ mode: "replace" });
       toast(existing ? t("Event saved") : t("Event created"));
       if (!existing) state.cursor = saved.all_day ? saved.start : zoneParts(new Date(saved.start)).day;
       await refresh();
     } catch (error) {
-      event.currentTarget?.classList.remove("is-busy");
-      $("#save", root).classList.remove("is-busy");
-      fail(error.message);
+      button.classList.remove("is-busy");
+      if (isConflict(error)) showConflict();
+      else fail(error.message);
+    } finally {
+      saving = false;
     }
   };
+  $("#save", root).onclick = (event) => save(event.currentTarget);
   sync();
-  eventEditorOpened(existing, defaults);
+  eventEditorOpened(existing, defaults, baseRevision ?? existing?.revision);
 }
 
 /* Import */
@@ -1688,13 +1831,17 @@ function subscribeDialog(existing) {
     if (!url) return $("#sub-url", root).setAttribute("aria-invalid", "true");
     event.currentTarget.classList.add("is-busy");
     try {
-      if (existing) await api(`/subscriptions/${existing.id}`, "PUT", { url });
+      if (existing) await api(`/subscriptions/${existing.id}`, "PUT", { url, expected_revision: existing.revision });
       else await api("/subscriptions", "POST", { name, url, color: pickedColor(root, "sub") || PALETTE[5], refresh_minutes: Number($("#sub-refresh", root).value) });
       closeDialog();
       toast(existing ? t("Address changed. Synchronizing…") : t("Subscribed. The first synchronization is running."));
       await refresh();
     } catch (failure) {
       $("#save", root).classList.remove("is-busy");
+      if (existing && isConflict(failure)) {
+        await loadState();
+        existing = calendarById(existing.id) || existing;
+      }
       error.textContent = failure.message;
       error.hidden = false;
     }
@@ -1852,7 +1999,13 @@ function calendarMenu(anchor, c) {
             text: c.event_count ? plural(c.event_count, "Its {count} event moves to Trash, and the calendar goes with it. You can restore them from Trash.", "Its {count} events move to Trash, and the calendar goes with them. You can restore them from Trash.") : t("This calendar has no events and will be removed."),
             label: t("Move to Trash"),
             run: async () => {
-              const result = await api(`/calendars/${c.id}?confirmed=true`, "DELETE");
+              let result;
+              try {
+                result = await api(`/calendars/${c.id}?confirmed=true&expected_revision=${c.revision}`, "DELETE");
+              } catch (error) {
+                if (isConflict(error)) await refresh();
+                throw error;
+              }
               await leaveDialog();
               const batch = result.trash?.batch;
               toast(t("Removed “{name}”", { name: c.name }), "", batch ? { label: t("Undo"), run: () => restoreBatch(batch) } : null);
@@ -1864,25 +2017,33 @@ function calendarMenu(anchor, c) {
             plural(c.event_count, "Its {count} event is removed from Chronos. This cannot be undone.", "Its {count} events are removed from Chronos. This cannot be undone."),
             c.kind === "subscription" ? t("Unsubscribe") : t("Delete"),
             async () => {
-              await attempt(() => api(`/calendars/${c.id}?confirmed=true`, "DELETE"), t("Removed “{name}”", { name: c.name }));
+              await attempt(() => api(`/calendars/${c.id}?confirmed=true&expected_revision=${c.revision}`, "DELETE"), t("Removed “{name}”", { name: c.name }));
               await refresh();
             },
           ),
   });
   openMenu(anchor, items);
 }
-function eventMenu(anchor, id, occurrence) {
+function eventMenu(anchor, id, occurrence, revision) {
   const o = findOccurrence(state.selected?.key);
   const items = [{ label: t("Duplicate"), icon: "copy", run: async () => { await attempt(() => api(`/events/${id}/copy`, "POST", { calendar_id: o?.calendar_id || nativeCalendars()[0].id }), t("Event duplicated")); closeLayer({ mode: "replace" }); await refresh(); } }];
   items.push("-");
   const recurring = !!(o?.recurring || o?.rrule);
-  if (recurring && occurrence) items.push({ label: t("Delete this occurrence"), icon: "trash", danger: true, run: () => moveToTrashDialog(id, occurrence, o) });
-  items.push({ label: recurring ? t("Delete all occurrences") : t("Delete event"), icon: "trash", danger: true, run: () => moveToTrashDialog(id, "", o) });
+  if (recurring && occurrence) items.push({ label: t("Delete this occurrence"), icon: "trash", danger: true, run: () => moveToTrashDialog(id, occurrence, o, revision) });
+  items.push({ label: recurring ? t("Delete all occurrences") : t("Delete event"), icon: "trash", danger: true, run: () => moveToTrashDialog(id, "", o, revision) });
   openMenu(anchor, items);
+}
+/** Show the current version in the open details, after finding out that it is no longer this one. */
+async function reloadDrawer() {
+  const selected = state.selected;
+  await refresh();
+  if (!selected) return;
+  if (findOccurrence(selected.key)) return openDetails(selected.key, selected.returnFocus);
+  closeLayer({ mode: "replace" });
 }
 /** Deleting is one explicit choice: one occurrence, the whole series, or a single event. The
  * backend also refuses a repeating event without one, so losing the choice cannot widen it. */
-function moveToTrashDialog(id, occurrence, o) {
+function moveToTrashDialog(id, occurrence, o, revision) {
   const name = o?.title || "";
   const recurring = !!(o?.recurring || o?.rrule);
   const copy = occurrence
@@ -1890,11 +2051,21 @@ function moveToTrashDialog(id, occurrence, o) {
     : recurring
       ? { title: t("Delete the whole series?"), text: t("Every occurrence of “{name}” moves to Trash. Restoring it brings the whole series back.", { name }), label: t("Delete all occurrences"), done: t("Series moved to Trash") }
       : { title: t("Move “{name}” to Trash?", { name }), text: t("You can restore it from Trash at any time."), label: t("Move to Trash"), done: t("Moved to Trash") };
-  const query = occurrence ? `?occurrence=${encodeURIComponent(occurrence)}` : recurring ? "?scope=series" : "";
+  const query = new URLSearchParams({ expected_revision: revision });
+  if (occurrence) query.set("occurrence", occurrence);
+  else if (recurring) query.set("scope", "series");
   trashConfirm({
     ...copy,
     run: async () => {
-      const result = await api(`/events/${id}${query}`, "DELETE");
+      let result;
+      try {
+        result = await api(`/events/${id}?${query}`, "DELETE");
+      } catch (error) {
+        if (!isConflict(error)) throw error;
+        await leaveDialog();
+        toast(t("This event changed elsewhere, so nothing was deleted. Here is the current version."), "danger");
+        return reloadDrawer();
+      }
       await leaveDialog();
       closeLayer({ mode: "replace" });
       toast(copy.done, "", result.trash ? { label: t("Undo"), run: () => restoreEntry(result.trash) } : null);
@@ -1960,7 +2131,7 @@ document.addEventListener("click", async (event) => {
   if (act === "new-calendar") return calendarDialog();
   if (act === "new-category") return categoryDialog();
   if (act === "calendar-menu") return calendarMenu(target, calendarById(id));
-  if (act === "event-menu") return eventMenu(target, id, target.dataset.occurrence);
+  if (act === "event-menu") return eventMenu(target, id, target.dataset.occurrence, target.dataset.revision);
   if (act === "filter-category") {
     if (event.detail === 2 || event.altKey) return categoryDialog(state.categories.find((c) => c.id === id));
     state.categoryFilter.has(id) ? state.categoryFilter.delete(id) : state.categoryFilter.add(id);

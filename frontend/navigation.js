@@ -97,19 +97,21 @@ const editorFields = () => {
   return { fields: $$("input, select, textarea", root).map((el) => (el.type === "checkbox" || el.type === "radio" ? el.checked : el.value)), days: $$("#ev-days [aria-pressed=true]", root).map((b) => b.dataset.day) };
 };
 let editorSession = null;
-function eventEditorOpened(existing, defaults) {
-  editorSession = { existing, defaults, baseline: JSON.stringify(editorFields()) };
+function eventEditorOpened(existing, defaults, revision) {
+  editorSession = { existing, defaults, revision, baseline: JSON.stringify(editorFields()) };
 }
 const editorOpen = () => dialog().open && !!$("#editor", dialog());
 const editorDirty = () => !!editorSession && editorOpen() && JSON.stringify(editorFields()) !== editorSession.baseline;
 function captureDraft() {
   if (!editorDirty()) return null;
   const { existing, defaults } = editorSession;
-  return { key: existing ? `event:${existing.id}` : "event:new", eventId: existing?.id || null, defaults, label: $("#ev-title", dialog()).value || t("New event"), route: shownRoute, ...editorFields() };
+  return { key: existing ? `event:${existing.id}` : "event:new", eventId: existing?.id || null, revision: editorSession.revision, defaults, label: $("#ev-title", dialog()).value || t("New event"), route: shownRoute, ...editorFields() };
 }
 async function reopenDraft(draft) {
   const existing = draft.eventId ? await api(`/events/${draft.eventId}`) : null;
-  await eventEditor(existing, draft.defaults || {});
+  // A draft stays based on the version it was written against, so a change made since is a
+  // conflict and not a silent overwrite. A draft from before revisions existed always conflicts.
+  await eventEditor(existing, draft.defaults || {}, existing ? (draft.revision ?? 0) : undefined);
   const root = dialog();
   $$("input, select, textarea", root).forEach((el, i) => {
     if (draft.fields[i] === undefined) return;

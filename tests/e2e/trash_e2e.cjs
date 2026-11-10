@@ -92,7 +92,7 @@ async function clearAll() {
     }
   }
   const trash = await call(frame, "/trash");
-  await call(frame, "/trash/empty", "POST", { confirmed: true, expected: trash.total });
+  await call(frame, "/trash/empty", "POST", { confirmed: true, expected_generation: trash.generation });
 }
 const addEvent = (title, extra = {}) =>
   call(frame, "/events", "POST", { calendar_id: calendarId, title, start: `${today}T10:00`, end: `${today}T11:00`, time_zone: zone, ...extra });
@@ -287,7 +287,8 @@ J["occurrence-after-series-changes"] = async () => {
   const series = await addWeekly(`WP03 changing ${RUN}`);
   const { occurrence } = await occurrenceKey(series.id, 1);
   const entry = (await call(frame, `/events/${series.id}?occurrence=${encodeURIComponent(occurrence)}`, "DELETE")).trash;
-  await call(frame, `/events/${series.id}`, "PUT", { calendar_id: calendarId, title: series.title, start: `${today}T15:00`, end: `${today}T16:00`, time_zone: zone, rrule: "FREQ=WEEKLY;COUNT=6" });
+  const latest = await call(frame, `/events/${series.id}`);
+  await call(frame, `/events/${series.id}`, "PUT", { expected_revision: latest.revision, calendar_id: calendarId, title: series.title, start: `${today}T15:00`, end: `${today}T16:00`, time_zone: zone, rrule: "FREQ=WEEKLY;COUNT=6" });
   await ready("/trash");
   await until(() => frame.locator(".trash-row").count().then((n) => n === 1), "listed");
   await frame.locator('.trash-row .trash-actions [data-act="trash-open"]').click();

@@ -302,5 +302,20 @@
   "{count} matches in Trash": "{count} matches in Trash",
   "“{name}” on {when} moves to Trash. The other occurrences stay on your calendar.": "“{name}” on {when} moves to Trash. The other occurrences stay on your calendar.",
   "“{name}” was deleted {when}. It stays recoverable until it is deleted for good.": "“{name}” was deleted {when}. It stays recoverable until it is deleted for good.",
-  "This calendar has no events and will be removed.": "This calendar has no events and will be removed."
+  "This calendar has no events and will be removed.": "This calendar has no events and will be removed.",
+  "Deleted or skipped occurrences": "Deleted or skipped occurrences",
+  "Discard my edits and use the stored version": "Discard my edits and use the stored version",
+  "Nothing was saved, and your edits are still here. Review the stored version before you decide.": "Nothing was saved, and your edits are still here. Review the stored version before you decide.",
+  "Review stored version": "Review stored version",
+  "Save my version": "Save my version",
+  "Stored now": "Stored now",
+  "The stored version now has the same details as your form.": "The stored version now has the same details as your form.",
+  "This calendar changed elsewhere. It is now named “{name}”. Your changes are still here; save again to replace it.": "This calendar changed elsewhere. It is now named “{name}”. Your changes are still here; save again to replace it.",
+  "This category changed elsewhere. It is now named “{name}”. Your changes are still here; save again to replace it.": "This category changed elsewhere. It is now named “{name}”. Your changes are still here; save again to replace it.",
+  "This event changed elsewhere": "This event changed elsewhere",
+  "This event changed elsewhere, so nothing was deleted. Here is the current version.": "This event changed elsewhere, so nothing was deleted. Here is the current version.",
+  "This no longer exists.": "This no longer exists.",
+  "When": "When",
+  "Your edit": "Your edit",
+  "{count} when you opened it": "{count} when you opened it"
 }
